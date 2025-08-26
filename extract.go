@@ -171,6 +171,7 @@ func extractPDFText(data []byte) ([]string, error) {
 	return pages, nil
 }
 
+// ODT Extractor => ALL TEXT NO CHUNK
 func extractODTText(data []byte) ([]string, error) {
 	// ODT is a ZIP archive with content.xml containing the text
 	r := bytes.NewReader(data)

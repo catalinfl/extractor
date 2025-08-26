@@ -1,14 +1,16 @@
-# Document Text Extraction Server
+# Document Text Extraction & OCR Server
 
-🚀 Server Fiber pentru extragerea de text din documente PDF și ODT.
+🚀 Server Fiber pentru extragerea de text din documente PDF și imagini cu suport OCR (Tesseract).
 
 ## Caracteristici
 
-- **Suport multiple formate**: PDF, ODT
+- **Suport multiple formate**: PDF, PNG, JPG, JPEG, TIFF, BMP
+- **OCR avansat**: Tesseract cu suport pentru multiple limbi
+- **Extragere directă PDF**: Text din PDF-uri căutabile
 - **API flexibil**: Returnează fie JSON structurat, fie text simplu
-- **Algoritm îmbunătățit**: Spațiere inteligentă între cuvinte pentru PDF-uri
 - **Upload mari**: Suportă fișiere până la 100MB
 - **CORS activat**: Ready pentru aplicații web frontend
+- **Docker ready**: Deployment simplu pe Railway, Heroku, etc.
 
 ## Endpoints
 
@@ -16,7 +18,7 @@
 Informații despre server și endpoints disponibili.
 
 ### 🔍 POST `/extract`
-Extrage text și returnează JSON structurat cu pagini.
+Extrage text din PDF și returnează JSON structurat cu pagini.
 
 **Request:**
 - Multipart form cu field `file`
@@ -37,11 +39,29 @@ Extrage text și returnează JSON structurat cu pagini.
 ```
 
 ### 📄 POST `/extract/text`
-Extrage text și returnează text simplu concatenat.
+Extrage text din PDF și returnează text simplu concatenat.
 
-**Request:** Același ca `/extract`
+### 👁️ POST `/extract/ocr`
+Extrage text din PDF-uri scanate sau imagini folosind OCR.
 
-**Response:** Plain text cu pagini separate prin `\n\n`
+**Request:**
+- Multipart form cu fields: `file`, `lang` (opțional, default: "eng")
+
+**Response:**
+```json
+{
+  "success": true,
+  "file_type": "pdf",
+  "num_pages": 2,
+  "language": "eng",
+  "pages": ["OCR text from page 1...", "OCR text from page 2..."],
+  "text": "Combined OCR text...",
+  "timestamp": "2025-08-26T14:12:59+03:00"
+}
+```
+
+### ℹ️ GET `/ocr/info`
+Informații despre capabilitățile OCR și limbile disponibile.
 
 ### ❤️ GET `/health`
 Health check pentru monitoring.
@@ -141,26 +161,95 @@ GOOS=linux GOARCH=amd64 go build -o document-extractor-linux
 ./document-extractor
 ```
 
+## 🚀 Railway Deployment
+
+### Quick Deploy
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/your-template-id)
+
+### Manual Deploy Steps
+
+1. **Connect Repository**
+   ```bash
+   # Using Railway CLI
+   railway login
+   railway link
+   railway up
+   ```
+
+2. **Or use Railway Dashboard**
+   - Go to [railway.app](https://railway.app)
+   - Click "New Project" → "Deploy from GitHub repo"
+   - Select this repository
+   - Railway auto-detects Dockerfile
+
+3. **Environment Variables** (Optional)
+   - Railway sets `PORT` automatically
+   - `TESSERACT_CMD` and `PDFTOPPM_CMD` not needed (pre-installed in Docker)
+
+### Docker Testing Local
+```bash
+# Build image
+docker build -t pdf-extractor .
+
+# Run container
+docker run -p 3000:3000 pdf-extractor
+
+# Test endpoints
+curl http://localhost:3000/health
+curl -F "file=@test.pdf" http://localhost:3000/extract/ocr
+```
+
 ## Configurare
 
-Aplicația folosește următoarele setări:
-- **Port**: 3000 (hardcoded)
+Aplicația respectă următoarele variabile de mediu:
+- **PORT**: Port server (default: 3000, Railway setează automat)
+- **TESSERACT_CMD**: Cale custom către tesseract executable (opțional)
+- **PDFTOPPM_CMD**: Cale custom către pdftoppm executable (opțional)
+
+### Setări aplicație:
 - **Body limit**: 100MB pentru upload-uri mari
-- **CORS**: Activat pentru toate origin-urile
+- **CORS**: Activat pentru toate origin-urile  
 - **Logging**: Middleware Fiber pentru request logging
 
 ## Dependențe
 
+### Go packages:
 - `github.com/gofiber/fiber/v2` - Web framework rapid
-- `rsc.io/pdf` - PDF reader pur Go (fără CGO)
-- Go standard library pentru ODT (archive/zip)
+- `github.com/ledongthuc/pdf` - PDF reader pur Go
+- Go standard library
+
+### System dependencies (Docker):
+- **Tesseract OCR** cu pachete limbi multiple
+- **Poppler utilities** pentru conversie PDF→imagine
+- **Ubuntu 22.04** base image
+
+## Limbile OCR suportate
+
+- `eng` - English
+- `fra` - French  
+- `deu` - German
+- `spa` - Spanish
+- `ita` - Italian
+- `por` - Portuguese
+- `rus` - Russian
+- `chi_sim` - Chinese Simplified
+- `jpn` - Japanese
+- `kor` - Korean
 
 ## Limitări
 
-- **PDF-uri scanate**: Nu face OCR; necesită text selectabil
-- **ODT complex**: Extrage doar textul de bază, fără formatare avansată
-- **Fonturi**: Rezultatele pot varia în funcție de fonturile folosite în PDF
+- **Dimensiune fișier**: Max 100MB
+- **Timeout**: 30s pentru procesare (Railway default)
+- **Formate suportate**: PDF, PNG, JPG, JPEG, TIFF, BMP
+- **OCR**: Depinde de calitatea imaginii și limba setată
+
+## Troubleshooting
+
+1. **Large files**: Verifică că fișierul e sub 100MB
+2. **OCR errors**: Verifică că limba e instalată (`/ocr/info` endpoint)
+3. **PDF conversion**: Verifică că fișierul nu e corupt
+4. **Railway logs**: Check deployment logs în Railway dashboard
 
 ## Contribuții
 
-Pentru îmbunătățiri ale algoritmului de spațiere sau suport pentru alte formate, deschide un issue sau PR.
+Pentru îmbunătățiri ale algoritmului sau suport pentru alte formate, deschide un issue sau PR.
