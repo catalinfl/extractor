@@ -19,11 +19,12 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# Performance optimizations - Railway 8 vCPU + 8GB aggressive settings
-ENV OMP_NUM_THREADS=8
-ENV OPENBLAS_NUM_THREADS=8
+# Performance optimizations - Scalable OCR with job queue
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
 ENV GOMAXPROCS=8
-ENV OCR_WORKERS=12
+ENV OCR_WORKERS=2
+ENV QUEUE_WORKERS=2
 # Railway high-performance optimizations
 ENV TESSERACT_PARALLEL=1
 ENV MALLOC_ARENA_MAX=4

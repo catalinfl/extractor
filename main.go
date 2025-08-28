@@ -23,7 +23,7 @@ type ExtractResponse struct {
 
 func main() {
 	app := fiber.New(fiber.Config{
-		BodyLimit:         100 << 20,        // 100 MB
+		BodyLimit:         15 << 20,         // 15 MB
 		ReadTimeout:       10 * time.Minute, // Railway timeout protection
 		WriteTimeout:      10 * time.Minute, // Railway timeout protection
 		IdleTimeout:       2 * time.Minute,  // Faster connection cleanup
@@ -48,12 +48,20 @@ func main() {
 	app.Post("/extract", handleExtractJSON)
 	app.Post("/extract/text", handleExtractText)
 	app.Post("/extract/ocr", handleExtractOCR)
+	
+	// Async OCR endpoints for scalability
+	app.Post("/extract/ocr/async", handleExtractOCRAsync)
+	app.Get("/extract/ocr/status/:jobId", handleGetJobStatus)
 
 	// Use PORT env var if present (Railway sets PORT)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
+	
+	// Initialize job queue system
+	initJobQueue()
+	
 	app.Listen(":" + port)
 }
 

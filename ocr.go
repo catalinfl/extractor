@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,9 +27,35 @@ type OCRResponse struct {
 	Language  string   `json:"language"`
 	Error     string   `json:"error,omitempty"`
 	Timestamp string   `json:"timestamp"`
+	JobID     string   `json:"job_id,omitempty"`
+	Status    string   `json:"status,omitempty"` // "pending", "processing", "completed", "failed"
 }
 
-// Worker pool for OCR processing
+// Job Queue System for scalable OCR processing
+type OCRJobRequest struct {
+	ID       string
+	FileData []byte
+	FileType string
+	Language string
+	TmpDir   string
+	Status   string
+	Result   *OCRResponse
+	Created  time.Time
+	Started  *time.Time
+	Finished *time.Time
+	mu       sync.RWMutex
+}
+
+type OCRJobQueue struct {
+	jobs     map[string]*OCRJobRequest
+	pending  chan string
+	workers  int
+	mu       sync.RWMutex
+}
+
+var jobQueue *OCRJobQueue
+
+// Traditional worker pool for internal page processing (limited threads)
 type OCRWorkerPool struct {
 	workers  int
 	jobQueue chan OCRJob
@@ -45,8 +73,261 @@ type OCRResult struct {
 }
 
 var ocrPool *OCRWorkerPool
+var globalJobQueue *OCRJobQueue
 var currentJobs int64
-var maxConcurrentJobs int64 = 3 // Railway throttling protection
+var maxConcurrentJobs int64 = 10 // Increased for better throughput
+
+// generateJobID creates a unique job identifier
+func generateJobID() string {
+	bytes := make([]byte, 8)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
+// initJobQueue initializes the background job processing system
+func initJobQueue() {
+	// Use fewer workers for job queue (2-4) to allow more concurrent requests
+	workers := 2
+	if envWorkers := os.Getenv("QUEUE_WORKERS"); envWorkers != "" {
+		if w, err := strconv.Atoi(envWorkers); err == nil && w > 0 {
+			workers = w
+		}
+	}
+
+	globalJobQueue = &OCRJobQueue{
+		jobs:    make(map[string]*OCRJobRequest),
+		pending: make(chan string, 50), // Large buffer for many requests
+		workers: workers,
+	}
+
+	// Start background workers
+	for i := 0; i < workers; i++ {
+		go globalJobQueue.worker(i)
+	}
+}
+
+// worker processes OCR jobs in background
+func (q *OCRJobQueue) worker(id int) {
+	for jobID := range q.pending {
+		q.processJob(jobID)
+	}
+}
+
+// processJob handles a single OCR job
+func (q *OCRJobQueue) processJob(jobID string) {
+	q.mu.RLock()
+	job, exists := q.jobs[jobID]
+	q.mu.RUnlock()
+	
+	if !exists {
+		return
+	}
+	
+	// Update job status
+	job.mu.Lock()
+	job.Status = "processing"
+	now := time.Now()
+	job.Started = &now
+	job.mu.Unlock()
+	
+	// Process OCR (existing logic)
+	result := q.performOCRJob(job)
+	
+	// Update job with result
+	job.mu.Lock()
+	job.Result = result
+	job.Status = "completed"
+	if result.Success == false {
+		job.Status = "failed"
+	}
+	finished := time.Now()
+	job.Finished = &finished
+	job.mu.Unlock()
+}
+
+// performOCRJob executes the actual OCR processing
+func (q *OCRJobQueue) performOCRJob(job *OCRJobRequest) *OCRResponse {
+	startTime := time.Now()
+	
+	var pages []string
+	var err error
+	
+	switch job.FileType {
+	case "pdf":
+		pages, err = extractOCRFromPDF(job.FileData, job.TmpDir, job.Language)
+	case "png", "jpg", "jpeg", "tiff", "bmp":
+		pages, err = extractOCRFromImage(job.FileData, job.TmpDir, job.Language, job.FileType)
+	default:
+		return &OCRResponse{
+			Success:   false,
+			Error:     fmt.Sprintf("Unsupported file type: %s", job.FileType),
+			Timestamp: startTime.Format(time.RFC3339),
+			JobID:     job.ID,
+			Status:    "failed",
+		}
+	}
+	
+	if err != nil {
+		return &OCRResponse{
+			Success:   false,
+			FileType:  job.FileType,
+			Language:  job.Language,
+			Error:     err.Error(),
+			Timestamp: startTime.Format(time.RFC3339),
+			JobID:     job.ID,
+			Status:    "failed",
+		}
+	}
+	
+	// Combine pages
+	extractedText := strings.Join(pages, "\n\n--- Page Break ---\n\n")
+	extractedText = strings.ReplaceAll(extractedText, "\r\n", "")
+	extractedText = strings.ReplaceAll(extractedText, "\n", "")
+	extractedText = strings.ReplaceAll(extractedText, "\r", "")
+	
+	return &OCRResponse{
+		Success:   true,
+		FileType:  job.FileType,
+		NumPages:  len(pages),
+		Text:      extractedText,
+		Language:  job.Language,
+		Timestamp: startTime.Format(time.RFC3339),
+		JobID:     job.ID,
+		Status:    "completed",
+	}
+}
+
+// submitJob adds a new OCR job to the queue
+func (q *OCRJobQueue) submitJob(fileData []byte, fileType, language, tmpDir string) string {
+	jobID := generateJobID()
+	
+	job := &OCRJobRequest{
+		ID:       jobID,
+		FileData: fileData,
+		FileType: fileType,
+		Language: language,
+		TmpDir:   tmpDir,
+		Status:   "pending",
+		Created:  time.Now(),
+	}
+	
+	q.mu.Lock()
+	q.jobs[jobID] = job
+	q.mu.Unlock()
+	
+	// Send to worker queue
+	select {
+	case q.pending <- jobID:
+		return jobID
+	default:
+		// Queue full - clean up and return error
+		q.mu.Lock()
+		delete(q.jobs, jobID)
+		q.mu.Unlock()
+		return ""
+	}
+}
+
+// getJobStatus retrieves job status and result
+func (q *OCRJobQueue) getJobStatus(jobID string) *OCRResponse {
+	q.mu.RLock()
+	job, exists := q.jobs[jobID]
+	q.mu.RUnlock()
+	
+	if !exists {
+		return &OCRResponse{
+			Success: false,
+			Error:   "Job not found",
+			JobID:   jobID,
+			Status:  "not_found",
+		}
+	}
+	
+	job.mu.RLock()
+	defer job.mu.RUnlock()
+	
+	if job.Result != nil {
+		return job.Result
+	}
+	
+	return &OCRResponse{
+		Success: true,
+		JobID:   jobID,
+		Status:  job.Status,
+	}
+}
+
+// handleExtractOCRAsync submits OCR job and returns job ID immediately
+func handleExtractOCRAsync(c *fiber.Ctx) error {
+	// Initialize systems
+	if globalJobQueue == nil {
+		initJobQueue()
+	}
+	if ocrPool == nil {
+		initOCRPool()
+	}
+	
+	// Get file from request
+	fileData, fileType, err := getFileFromRequest(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(OCRResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+	}
+	
+	// Get language parameter
+	language := c.FormValue("language")
+	if language == "" {
+		language = "eng"
+	}
+	
+	// Create temporary directory
+	tmpDir, err := os.MkdirTemp("", "ocr_*")
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(OCRResponse{
+			Success: false,
+			Error:   "Failed to create temporary directory",
+		})
+	}
+	
+	// Submit job to queue
+	jobID := globalJobQueue.submitJob(fileData, fileType, language, tmpDir)
+	if jobID == "" {
+		return c.Status(fiber.StatusTooManyRequests).JSON(OCRResponse{
+			Success: false,
+			Error:   "Queue is full - please try again later",
+		})
+	}
+	
+	return c.JSON(OCRResponse{
+		Success:   true,
+		JobID:     jobID,
+		Status:    "pending",
+		Timestamp: time.Now().Format(time.RFC3339),
+	})
+}
+
+// handleGetJobStatus returns current job status and result
+func handleGetJobStatus(c *fiber.Ctx) error {
+	jobID := c.Params("jobId")
+	if jobID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(OCRResponse{
+			Success: false,
+			Error:   "Job ID required",
+		})
+	}
+	
+	if globalJobQueue == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(OCRResponse{
+			Success: false,
+			Error:   "Job queue not initialized",
+		})
+	}
+	
+	result := globalJobQueue.getJobStatus(jobID)
+	return c.JSON(result)
+}
 
 // CPU load monitoring
 var cpuLoadHigh bool
@@ -130,18 +411,25 @@ func recordSuccess() {
 	atomic.StoreInt64(&failures, 0)
 }
 
-// Initialize OCR worker pool
+// Initialize OCR worker pool (for internal page processing - LIMITED threads)
 func initOCRPool() {
-	workers := runtime.NumCPU()
+	// Use fewer workers to leave CPU for multiple concurrent requests
+	workers := 2 // Conservative for scalability
+	
 	if w := os.Getenv("OCR_WORKERS"); w != "" {
 		if v, err := strconv.Atoi(w); err == nil && v > 0 {
 			workers = v
 		}
 	}
+	
+	// Don't exceed 4 workers to avoid CPU saturation
+	if workers > 4 {
+		workers = 4
+	}
 
 	ocrPool = &OCRWorkerPool{
 		workers:  workers,
-		jobQueue: make(chan OCRJob, workers*6), // Large buffer for high throughput 8 vCPU
+		jobQueue: make(chan OCRJob, workers*2), // Smaller buffer for limited workers
 	}
 
 	// Start worker goroutines
