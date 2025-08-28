@@ -19,11 +19,15 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# Performance optimizations for 8 vCPU
+# Performance optimizations - Railway 8 vCPU + 8GB aggressive settings
 ENV OMP_NUM_THREADS=8
 ENV OPENBLAS_NUM_THREADS=8
 ENV GOMAXPROCS=8
-ENV OCR_WORKERS=8
+ENV OCR_WORKERS=12
+# Railway high-performance optimizations
+ENV TESSERACT_PARALLEL=1
+ENV MALLOC_ARENA_MAX=4
+ENV PDF_DPI=75
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

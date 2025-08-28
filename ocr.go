@@ -56,7 +56,7 @@ func initOCRPool() {
 
 	ocrPool = &OCRWorkerPool{
 		workers:  workers,
-		jobQueue: make(chan OCRJob, workers*2), // Buffer for jobs
+		jobQueue: make(chan OCRJob, workers*6), // Large buffer for high throughput 8 vCPU
 	}
 
 	// Start worker goroutines
@@ -191,9 +191,17 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 		return nil, fmt.Errorf("failed to write PDF file: %v", err)
 	}
 
-	// Convert PDF pages to PNG images (ultra-fast DPI for maximum speed)
+	// Convert PDF pages to PNG images (DPI configurable via env)
 	outputPrefix := filepath.Join(tmpDir, "page")
-	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "100", "-cropbox", pdfPath, outputPrefix)
+
+	// Use PDF_DPI env var or default to 75 for Railway performance
+	dpi := "100"
+	if envDPI := os.Getenv("PDF_DPI"); envDPI != "" {
+		dpi = envDPI
+	}
+
+	// Optimized pdftoppm with parallel processing hints
+	cmd := exec.Command(pdftoppmCmd, "-png", "-r", dpi, "-cropbox", "-aa", "no", pdfPath, outputPrefix)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("pdftoppm failed: %v - %s", err, string(output))
 	}
@@ -289,31 +297,34 @@ func extractOCRFromImage(imageData []byte, tmpDir, language, fileType string) ([
 
 // performOCRDirect runs Tesseract OCR directly (used by worker pool)
 func performOCRDirect(imagePath, language string) (string, error) {
-	// Tesseract optimized for maximum speed:
-	// --psm 6 = single uniform block (fastest for clean pages)
+	// Tesseract optimized for Railway 8 vCPU maximum performance:
+	// --psm 3 = fully automatic page segmentation (reliable and fast)
 	// --oem 1 = LSTM only (faster than combined)
-	// -c tessedit_char_whitelist= = no character restrictions (faster processing)
-	// -c tessedit_do_invert=0 = disable image inversion check
-	// -c load_system_dawg=0 = disable system dictionary
-	// -c load_freq_dawg=0 = disable frequency dictionary
+	// Disable dictionaries for speed but keep accuracy
 	cmd := exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language,
-		"--psm", "6", "--oem", "1",
+		"--psm", "3", "--oem", "1",
 		"-c", "tessedit_do_invert=0",
 		"-c", "load_system_dawg=0",
-		"-c", "load_freq_dawg=0")
+		"-c", "load_freq_dawg=0",
+		"-c", "load_unambig_dawg=0",
+		"-c", "textord_heavy_nr=1")
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Fallback to safer PSM if aggressive mode fails
-		cmd = exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language, "--psm", "3", "--oem", "1")
+		// Fallback to even simpler mode
+		cmd = exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language, "--psm", "6", "--oem", "1")
 		output, err = cmd.CombinedOutput()
 		if err != nil {
-			// Check if it's a language error
-			errorMsg := string(output)
-			if strings.Contains(errorMsg, "language") {
-				return "", fmt.Errorf("unsupported language '%s': %v - install language pack or use 'eng'", language, err)
+			// Final fallback - basic mode
+			cmd = exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language)
+			output, err = cmd.CombinedOutput()
+			if err != nil {
+				errorMsg := string(output)
+				if strings.Contains(errorMsg, "language") {
+					return "", fmt.Errorf("unsupported language '%s': %v - install language pack or use 'eng'", language, err)
+				}
+				return "", fmt.Errorf("tesseract failed: %v - %s", err, errorMsg)
 			}
-			return "", fmt.Errorf("tesseract failed: %v - %s", err, errorMsg)
 		}
 	}
 
