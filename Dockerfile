@@ -28,6 +28,11 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
+# Set threading environment variables for Railway (conservative)
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV GOMAXPROCS=1
+ENV OCR_WORKERS=1
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -35,6 +40,7 @@ RUN apt-get update && apt-get install -y \
     poppler-utils \
     ca-certificates \
     wget \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Download selected language models (use tessdata_fast for smaller size)
@@ -65,12 +71,12 @@ RUN tesseract --version && pdftoppm -h
 # Switch to non-root user
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-3000}/health || exit 1
+# Health check (disable - Railway doesn't need it)
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+#     CMD curl -f http://localhost:${PORT:-3000}/health || exit 1
 
-# Expose port (Railway will set PORT env var)
-EXPOSE 3001
+# Expose default port (Railway will set PORT env var at runtime)
+EXPOSE 3000
 
 # Run the application
 CMD ["./main"]

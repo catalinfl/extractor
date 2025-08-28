@@ -46,7 +46,7 @@ func main() {
 	// Use PORT env var if present (Railway sets PORT)
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "3001"
+		port = "3000"
 	}
 	app.Listen(":" + port)
 }
