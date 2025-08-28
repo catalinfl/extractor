@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -44,6 +45,90 @@ type OCRResult struct {
 }
 
 var ocrPool *OCRWorkerPool
+var currentJobs int64
+var maxConcurrentJobs int64 = 3 // Railway throttling protection
+
+// CPU load monitoring
+var cpuLoadHigh bool
+var lastCPUCheck time.Time
+
+// Circuit breaker state
+type CircuitState int32
+
+const (
+	Closed CircuitState = iota
+	Open
+	HalfOpen
+)
+
+var circuitState int32 = int32(Closed)
+var failures int64
+var lastFailureTime time.Time
+
+// checkSystemLoad monitors CPU and memory to prevent Railway throttling
+func checkSystemLoad() bool {
+	now := time.Now()
+	if now.Sub(lastCPUCheck) < 2*time.Second {
+		return !cpuLoadHigh
+	}
+
+	lastCPUCheck = now
+
+	// Check concurrent jobs
+	current := atomic.LoadInt64(&currentJobs)
+	if current >= maxConcurrentJobs {
+		cpuLoadHigh = true
+		return false
+	}
+
+	// Check memory pressure (simplified)
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	if m.Alloc > 6*1024*1024*1024 { // 6GB threshold for 8GB system
+		cpuLoadHigh = true
+		return false
+	}
+
+	cpuLoadHigh = false
+	return true
+}
+
+// isCircuitOpen checks if circuit breaker should block requests
+func isCircuitOpen() bool {
+	state := CircuitState(atomic.LoadInt32(&circuitState))
+
+	switch state {
+	case Open:
+		// Try to close circuit after 10 seconds
+		if time.Since(lastFailureTime) > 10*time.Second {
+			atomic.CompareAndSwapInt32(&circuitState, int32(Open), int32(HalfOpen))
+			return false
+		}
+		return true
+	case HalfOpen:
+		return false
+	default:
+		return false
+	}
+}
+
+// recordFailure tracks failures for circuit breaker
+func recordFailure() {
+	atomic.AddInt64(&failures, 1)
+	lastFailureTime = time.Now()
+
+	// Open circuit after 3 failures
+	if atomic.LoadInt64(&failures) >= 3 {
+		atomic.StoreInt32(&circuitState, int32(Open))
+		atomic.StoreInt64(&failures, 0)
+	}
+}
+
+// recordSuccess resets circuit breaker
+func recordSuccess() {
+	atomic.StoreInt32(&circuitState, int32(Closed))
+	atomic.StoreInt64(&failures, 0)
+}
 
 // Initialize OCR worker pool
 func initOCRPool() {
@@ -93,6 +178,28 @@ func (p *OCRWorkerPool) processOCR(imagePath, language string) (string, error) {
 // handleExtractOCR performs OCR extraction on uploaded files
 func handleExtractOCR(c *fiber.Ctx) error {
 	startTime := time.Now()
+
+	// Circuit breaker check
+	if isCircuitOpen() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(OCRResponse{
+			Success:   false,
+			Error:     "Service temporarily unavailable - system recovering",
+			Timestamp: startTime.Format(time.RFC3339),
+		})
+	}
+
+	// System load check - Railway throttling protection
+	if !checkSystemLoad() {
+		return c.Status(fiber.StatusTooManyRequests).JSON(OCRResponse{
+			Success:   false,
+			Error:     "System under high load - please retry in a few seconds",
+			Timestamp: startTime.Format(time.RFC3339),
+		})
+	}
+
+	// Track concurrent jobs
+	atomic.AddInt64(&currentJobs, 1)
+	defer atomic.AddInt64(&currentJobs, -1)
 
 	// Initialize pool if not done
 	if ocrPool == nil {
@@ -152,6 +259,8 @@ func handleExtractOCR(c *fiber.Ctx) error {
 	}
 
 	if err != nil {
+		// Record failure for circuit breaker
+		recordFailure()
 		return c.Status(fiber.StatusInternalServerError).JSON(OCRResponse{
 			Success:   false,
 			FileType:  fileType,
@@ -166,6 +275,9 @@ func handleExtractOCR(c *fiber.Ctx) error {
 	extractedText = strings.ReplaceAll(extractedText, "\r\n", "")
 	extractedText = strings.ReplaceAll(extractedText, "\n", "")
 	extractedText = strings.ReplaceAll(extractedText, "\r", "")
+
+	// Success - record it for circuit breaker
+	recordSuccess()
 
 	return c.JSON(OCRResponse{
 		Success:   true,

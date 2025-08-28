@@ -28,6 +28,9 @@ ENV OCR_WORKERS=12
 ENV TESSERACT_PARALLEL=1
 ENV MALLOC_ARENA_MAX=4
 ENV PDF_DPI=75
+# Railway anti-throttling settings
+ENV GOGC=50
+ENV GOMEMLIMIT=7GiB
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

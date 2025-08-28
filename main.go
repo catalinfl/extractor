@@ -23,10 +23,16 @@ type ExtractResponse struct {
 
 func main() {
 	app := fiber.New(fiber.Config{
-		BodyLimit:    100 << 20,        // 100 MB
-		ReadTimeout:  15 * time.Minute, // Allow long OCR requests
-		WriteTimeout: 15 * time.Minute,
-		IdleTimeout:  5 * time.Minute,
+		BodyLimit:         100 << 20,        // 100 MB
+		ReadTimeout:       10 * time.Minute, // Railway timeout protection
+		WriteTimeout:      10 * time.Minute, // Railway timeout protection
+		IdleTimeout:       2 * time.Minute,  // Faster connection cleanup
+		DisableKeepalive:  false,            // Keep connections alive
+		ReadBufferSize:    8192,             // Optimized buffer
+		WriteBufferSize:   8192,
+		ProxyHeader:       "X-Forwarded-For",
+		ServerHeader:      "PDF-Extractor-Railway",
+		ReduceMemoryUsage: true, // Railway memory optimization
 	})
 
 	// Middleware
