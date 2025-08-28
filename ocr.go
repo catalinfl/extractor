@@ -194,14 +194,8 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 	// Convert PDF pages to PNG images (DPI configurable via env)
 	outputPrefix := filepath.Join(tmpDir, "page")
 
-	// Use PDF_DPI env var or default to 75 for Railway performance
-	dpi := "100"
-	if envDPI := os.Getenv("PDF_DPI"); envDPI != "" {
-		dpi = envDPI
-	}
-
 	// Optimized pdftoppm with parallel processing hints
-	cmd := exec.Command(pdftoppmCmd, "-png", "-r", dpi, "-cropbox", "-aa", "no", pdfPath, outputPrefix)
+	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "120", "-cropbox", "-aa", "no", pdfPath, outputPrefix)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("pdftoppm failed: %v - %s", err, string(output))
 	}
