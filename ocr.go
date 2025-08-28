@@ -5,7 +5,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -23,9 +26,79 @@ type OCRResponse struct {
 	Timestamp string   `json:"timestamp"`
 }
 
+// Worker pool for OCR processing
+type OCRWorkerPool struct {
+	workers  int
+	jobQueue chan OCRJob
+	wg       sync.WaitGroup
+}
+
+type OCRJob struct {
+	imagePath string
+	language  string
+	result    chan OCRResult
+}
+
+type OCRResult struct {
+	text string
+	err  error
+}
+
+var ocrPool *OCRWorkerPool
+
+// Initialize OCR worker pool
+func initOCRPool() {
+	workers := runtime.NumCPU()
+	if w := os.Getenv("OCR_WORKERS"); w != "" {
+		if v, err := strconv.Atoi(w); err == nil && v > 0 {
+			workers = v
+		}
+	}
+
+	ocrPool = &OCRWorkerPool{
+		workers:  workers,
+		jobQueue: make(chan OCRJob, workers*2), // Buffer for jobs
+	}
+
+	// Start worker goroutines
+	for i := 0; i < workers; i++ {
+		go ocrPool.worker()
+	}
+}
+
+func (p *OCRWorkerPool) worker() {
+	for job := range p.jobQueue {
+		text, err := performOCRDirect(job.imagePath, job.language)
+		job.result <- OCRResult{text: text, err: err}
+	}
+}
+
+func (p *OCRWorkerPool) processOCR(imagePath, language string) (string, error) {
+	result := make(chan OCRResult, 1)
+	job := OCRJob{
+		imagePath: imagePath,
+		language:  language,
+		result:    result,
+	}
+
+	select {
+	case p.jobQueue <- job:
+		res := <-result
+		return res.text, res.err
+	default:
+		// Fallback if pool is full
+		return performOCRDirect(imagePath, language)
+	}
+}
+
 // handleExtractOCR performs OCR extraction on uploaded files
 func handleExtractOCR(c *fiber.Ctx) error {
 	startTime := time.Now()
+
+	// Initialize pool if not done
+	if ocrPool == nil {
+		initOCRPool()
+	}
 
 	// Check Tesseract installation
 	if err := checkTesseractInstallation(); err != nil {
@@ -105,7 +178,7 @@ func handleExtractOCR(c *fiber.Ctx) error {
 	})
 }
 
-// extractOCRFromPDF converts PDF pages to images and performs OCR
+// extractOCRFromPDF converts PDF pages to images and performs OCR with parallel processing
 func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error) {
 	// Check if pdftoppm is available (allow override with PDFTOPPM_CMD)
 	pdftoppmCmd := getPdftoppmCmd()
@@ -121,7 +194,7 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 
 	// Convert PDF pages to PNG images
 	outputPrefix := filepath.Join(tmpDir, "page")
-	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "300", pdfPath, outputPrefix)
+	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "150", pdfPath, outputPrefix)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("pdftoppm failed: %v - %s", err, string(output))
 	}
@@ -133,16 +206,36 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 		return nil, fmt.Errorf("no pages were converted from PDF")
 	}
 
-	// Perform OCR on each image
-	pages := make([]string, 0, len(imageFiles))
-	for _, imagePath := range imageFiles {
-		text, err := performOCR(imagePath, language)
-		if err != nil {
-			// Continue with empty text for failed pages
-			pages = append(pages, fmt.Sprintf("[OCR Error: %v]", err))
-			continue
-		}
-		pages = append(pages, text)
+	// Parallel OCR processing with worker pool
+	type pageResult struct {
+		index int
+		text  string
+		err   error
+	}
+
+	resultChan := make(chan pageResult, len(imageFiles))
+	var wg sync.WaitGroup
+
+	// Process pages in parallel
+	for i, imagePath := range imageFiles {
+		wg.Add(1)
+		go func(idx int, path string) {
+			defer wg.Done()
+			text, err := ocrPool.processOCR(path, language)
+			if err != nil {
+				text = fmt.Sprintf("[OCR Error: %v]", err)
+			}
+			resultChan <- pageResult{index: idx, text: text, err: err}
+		}(i, imagePath)
+	}
+
+	wg.Wait()
+	close(resultChan)
+
+	// Collect results in order
+	pages := make([]string, len(imageFiles))
+	for result := range resultChan {
+		pages[result.index] = result.text
 	}
 
 	return pages, nil
@@ -164,8 +257,8 @@ func extractOCRFromImage(imageData []byte, tmpDir, language, fileType string) ([
 		return nil, fmt.Errorf("failed to write image file: %v", err)
 	}
 
-	// Perform OCR
-	text, err := performOCR(imagePath, language)
+	// Perform OCR using worker pool
+	text, err := ocrPool.processOCR(imagePath, language)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +266,13 @@ func extractOCRFromImage(imageData []byte, tmpDir, language, fileType string) ([
 	return []string{text}, nil
 }
 
-// performOCR runs Tesseract OCR on a single image file
-func performOCR(imagePath, language string) (string, error) {
+// performOCR runs Tesseract OCR on a single image file (legacy function, keep for compatibility)
+// func performOCR(imagePath, language string) (string, error) {
+// 	return performOCRDirect(imagePath, language)
+// }
+
+// performOCRDirect runs Tesseract OCR directly (used by worker pool)
+func performOCRDirect(imagePath, language string) (string, error) {
 	// Run tesseract command: tesseract image.png stdout -l language
 	cmd := exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language)
 
@@ -198,7 +296,6 @@ func checkTesseractInstallation() error {
 	cmd := exec.Command(cmdName, "--version")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Provide helpful message mentioning env override
 		return fmt.Errorf("tesseract not found or failed to run")
 	}
 

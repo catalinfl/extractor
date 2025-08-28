@@ -1,11 +1,14 @@
 package main
 
 import (
+	"os"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 )
 
 type ExtractResponse struct {
@@ -20,12 +23,18 @@ type ExtractResponse struct {
 
 func main() {
 	app := fiber.New(fiber.Config{
-		BodyLimit: 100 << 20, // 100 MB
+		BodyLimit:    100 << 20,        // 100 MB
+		ReadTimeout:  15 * time.Minute, // Allow long OCR requests
+		WriteTimeout: 15 * time.Minute,
+		IdleTimeout:  5 * time.Minute,
 	})
 
+	// Middleware
+	app.Use(recover.New()) // Prevent panics from killing connections
 	app.Use(logger.New())
 	app.Use(cors.New())
 
+	// Routes
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok", "service": "document-extractor"})
 	})
@@ -34,7 +43,12 @@ func main() {
 	app.Post("/extract/text", handleExtractText)
 	app.Post("/extract/ocr", handleExtractOCR)
 
-	app.Listen(":3000")
+	// Use PORT env var if present (Railway sets PORT)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3001"
+	}
+	app.Listen(":" + port)
 }
 
 func handleExtractText(c *fiber.Ctx) error {

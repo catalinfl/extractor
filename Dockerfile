@@ -4,10 +4,10 @@
 # Build stage
 FROM golang:1.24-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
-
 WORKDIR /app
+
+# Install dependencies for building
+RUN apk add --no-cache git ca-certificates tzdata
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -27,6 +27,7 @@ FROM ubuntu:22.04
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
+
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -55,21 +56,21 @@ WORKDIR /app
 # Copy built application from builder stage
 COPY --from=builder /app/main .
 
-# Create tmp directory with proper permissions
+# Create temp directory with proper permissions
 RUN mkdir -p /app/tmp && chown -R appuser:appuser /app
-
-# Switch to non-root user
-USER appuser
 
 # Verify installations
 RUN tesseract --version && pdftoppm -h
 
-# Expose port (Railway uses PORT env variable)
-EXPOSE 3000
+# Switch to non-root user
+USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+    CMD curl -f http://localhost:${PORT:-3000}/health || exit 1
+
+# Expose port (Railway will set PORT env var)
+EXPOSE 3001
 
 # Run the application
 CMD ["./main"]
