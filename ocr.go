@@ -195,7 +195,7 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 	outputPrefix := filepath.Join(tmpDir, "page")
 
 	// Optimized pdftoppm with parallel processing hints
-	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "120", "-cropbox", "-aa", "no", pdfPath, outputPrefix)
+	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "100", "-cropbox", "-aa", "no", pdfPath, outputPrefix)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("pdftoppm failed: %v - %s", err, string(output))
 	}
