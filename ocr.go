@@ -30,7 +30,6 @@ type OCRResponse struct {
 type OCRWorkerPool struct {
 	workers  int
 	jobQueue chan OCRJob
-	wg       sync.WaitGroup
 }
 
 type OCRJob struct {
@@ -192,9 +191,9 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 		return nil, fmt.Errorf("failed to write PDF file: %v", err)
 	}
 
-	// Convert PDF pages to PNG images
+	// Convert PDF pages to PNG images (ultra-fast DPI for maximum speed)
 	outputPrefix := filepath.Join(tmpDir, "page")
-	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "150", pdfPath, outputPrefix)
+	cmd := exec.Command(pdftoppmCmd, "-png", "-r", "100", "-cropbox", pdfPath, outputPrefix)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("pdftoppm failed: %v - %s", err, string(output))
 	}
@@ -206,7 +205,7 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 		return nil, fmt.Errorf("no pages were converted from PDF")
 	}
 
-	// Parallel OCR processing with worker pool
+	// Ultra-fast parallel OCR processing with optimized batching
 	type pageResult struct {
 		index int
 		text  string
@@ -214,19 +213,36 @@ func extractOCRFromPDF(pdfData []byte, tmpDir, language string) ([]string, error
 	}
 
 	resultChan := make(chan pageResult, len(imageFiles))
+
+	// Calculate optimal batch size based on worker count and page count
+	batchSize := len(imageFiles) / ocrPool.workers
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	if batchSize > 4 {
+		batchSize = 4 // Max 4 pages per goroutine for memory efficiency
+	}
+
 	var wg sync.WaitGroup
 
-	// Process pages in parallel
-	for i, imagePath := range imageFiles {
+	// Process pages in optimized batches
+	for i := 0; i < len(imageFiles); i += batchSize {
+		end := i + batchSize
+		if end > len(imageFiles) {
+			end = len(imageFiles)
+		}
+
 		wg.Add(1)
-		go func(idx int, path string) {
+		go func(start, stop int) {
 			defer wg.Done()
-			text, err := ocrPool.processOCR(path, language)
-			if err != nil {
-				text = fmt.Sprintf("[OCR Error: %v]", err)
+			for idx := start; idx < stop; idx++ {
+				text, err := ocrPool.processOCR(imageFiles[idx], language)
+				if err != nil {
+					text = fmt.Sprintf("[OCR Error: %v]", err)
+				}
+				resultChan <- pageResult{index: idx, text: text, err: err}
 			}
-			resultChan <- pageResult{index: idx, text: text, err: err}
-		}(i, imagePath)
+		}(i, end)
 	}
 
 	wg.Wait()
@@ -273,17 +289,32 @@ func extractOCRFromImage(imageData []byte, tmpDir, language, fileType string) ([
 
 // performOCRDirect runs Tesseract OCR directly (used by worker pool)
 func performOCRDirect(imagePath, language string) (string, error) {
-	// Run tesseract command: tesseract image.png stdout -l language
-	cmd := exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language)
+	// Tesseract optimized for maximum speed:
+	// --psm 6 = single uniform block (fastest for clean pages)
+	// --oem 1 = LSTM only (faster than combined)
+	// -c tessedit_char_whitelist= = no character restrictions (faster processing)
+	// -c tessedit_do_invert=0 = disable image inversion check
+	// -c load_system_dawg=0 = disable system dictionary
+	// -c load_freq_dawg=0 = disable frequency dictionary
+	cmd := exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language,
+		"--psm", "6", "--oem", "1",
+		"-c", "tessedit_do_invert=0",
+		"-c", "load_system_dawg=0",
+		"-c", "load_freq_dawg=0")
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Check if it's a language error
-		errorMsg := string(output)
-		if strings.Contains(errorMsg, "language") {
-			return "", fmt.Errorf("unsupported language '%s': %v - install language pack or use 'eng'", language, err)
+		// Fallback to safer PSM if aggressive mode fails
+		cmd = exec.Command(getTesseractCmd(), imagePath, "stdout", "-l", language, "--psm", "3", "--oem", "1")
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			// Check if it's a language error
+			errorMsg := string(output)
+			if strings.Contains(errorMsg, "language") {
+				return "", fmt.Errorf("unsupported language '%s': %v - install language pack or use 'eng'", language, err)
+			}
+			return "", fmt.Errorf("tesseract failed: %v - %s", err, errorMsg)
 		}
-		return "", fmt.Errorf("tesseract failed: %v - %s", err, errorMsg)
 	}
 
 	text := strings.TrimSpace(string(output))

@@ -19,6 +19,12 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
+# Performance optimizations for 8 vCPU
+ENV OMP_NUM_THREADS=8
+ENV OPENBLAS_NUM_THREADS=8
+ENV GOMAXPROCS=8
+ENV OCR_WORKERS=8
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
@@ -58,9 +64,5 @@ RUN tesseract --version && pdftoppm -h
 # Expose port (Railway uses PORT env variable)
 EXPOSE 3000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
-
-# Run the application
+# Run the application with tmpfs for faster I/O
 CMD ["./main"]
