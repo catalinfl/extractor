@@ -47,10 +47,10 @@ type OCRJobRequest struct {
 }
 
 type OCRJobQueue struct {
-	jobs     map[string]*OCRJobRequest
-	pending  chan string
-	workers  int
-	mu       sync.RWMutex
+	jobs    map[string]*OCRJobRequest
+	pending chan string
+	workers int
+	mu      sync.RWMutex
 }
 
 var jobQueue *OCRJobQueue
@@ -118,21 +118,21 @@ func (q *OCRJobQueue) processJob(jobID string) {
 	q.mu.RLock()
 	job, exists := q.jobs[jobID]
 	q.mu.RUnlock()
-	
+
 	if !exists {
 		return
 	}
-	
+
 	// Update job status
 	job.mu.Lock()
 	job.Status = "processing"
 	now := time.Now()
 	job.Started = &now
 	job.mu.Unlock()
-	
+
 	// Process OCR (existing logic)
 	result := q.performOCRJob(job)
-	
+
 	// Update job with result
 	job.mu.Lock()
 	job.Result = result
@@ -148,10 +148,10 @@ func (q *OCRJobQueue) processJob(jobID string) {
 // performOCRJob executes the actual OCR processing
 func (q *OCRJobQueue) performOCRJob(job *OCRJobRequest) *OCRResponse {
 	startTime := time.Now()
-	
+
 	var pages []string
 	var err error
-	
+
 	switch job.FileType {
 	case "pdf":
 		pages, err = extractOCRFromPDF(job.FileData, job.TmpDir, job.Language)
@@ -166,7 +166,7 @@ func (q *OCRJobQueue) performOCRJob(job *OCRJobRequest) *OCRResponse {
 			Status:    "failed",
 		}
 	}
-	
+
 	if err != nil {
 		return &OCRResponse{
 			Success:   false,
@@ -178,13 +178,13 @@ func (q *OCRJobQueue) performOCRJob(job *OCRJobRequest) *OCRResponse {
 			Status:    "failed",
 		}
 	}
-	
+
 	// Combine pages
 	extractedText := strings.Join(pages, "\n\n--- Page Break ---\n\n")
 	extractedText = strings.ReplaceAll(extractedText, "\r\n", "")
 	extractedText = strings.ReplaceAll(extractedText, "\n", "")
 	extractedText = strings.ReplaceAll(extractedText, "\r", "")
-	
+
 	return &OCRResponse{
 		Success:   true,
 		FileType:  job.FileType,
@@ -200,7 +200,7 @@ func (q *OCRJobQueue) performOCRJob(job *OCRJobRequest) *OCRResponse {
 // submitJob adds a new OCR job to the queue
 func (q *OCRJobQueue) submitJob(fileData []byte, fileType, language, tmpDir string) string {
 	jobID := generateJobID()
-	
+
 	job := &OCRJobRequest{
 		ID:       jobID,
 		FileData: fileData,
@@ -210,11 +210,11 @@ func (q *OCRJobQueue) submitJob(fileData []byte, fileType, language, tmpDir stri
 		Status:   "pending",
 		Created:  time.Now(),
 	}
-	
+
 	q.mu.Lock()
 	q.jobs[jobID] = job
 	q.mu.Unlock()
-	
+
 	// Send to worker queue
 	select {
 	case q.pending <- jobID:
@@ -233,7 +233,7 @@ func (q *OCRJobQueue) getJobStatus(jobID string) *OCRResponse {
 	q.mu.RLock()
 	job, exists := q.jobs[jobID]
 	q.mu.RUnlock()
-	
+
 	if !exists {
 		return &OCRResponse{
 			Success: false,
@@ -242,14 +242,14 @@ func (q *OCRJobQueue) getJobStatus(jobID string) *OCRResponse {
 			Status:  "not_found",
 		}
 	}
-	
+
 	job.mu.RLock()
 	defer job.mu.RUnlock()
-	
+
 	if job.Result != nil {
 		return job.Result
 	}
-	
+
 	return &OCRResponse{
 		Success: true,
 		JobID:   jobID,
@@ -266,7 +266,7 @@ func handleExtractOCRAsync(c *fiber.Ctx) error {
 	if ocrPool == nil {
 		initOCRPool()
 	}
-	
+
 	// Get file from request
 	fileData, fileType, err := getFileFromRequest(c)
 	if err != nil {
@@ -275,13 +275,13 @@ func handleExtractOCRAsync(c *fiber.Ctx) error {
 			Error:   err.Error(),
 		})
 	}
-	
+
 	// Get language parameter
 	language := c.FormValue("language")
 	if language == "" {
 		language = "eng"
 	}
-	
+
 	// Create temporary directory
 	tmpDir, err := os.MkdirTemp("", "ocr_*")
 	if err != nil {
@@ -290,7 +290,7 @@ func handleExtractOCRAsync(c *fiber.Ctx) error {
 			Error:   "Failed to create temporary directory",
 		})
 	}
-	
+
 	// Submit job to queue
 	jobID := globalJobQueue.submitJob(fileData, fileType, language, tmpDir)
 	if jobID == "" {
@@ -299,7 +299,7 @@ func handleExtractOCRAsync(c *fiber.Ctx) error {
 			Error:   "Queue is full - please try again later",
 		})
 	}
-	
+
 	return c.JSON(OCRResponse{
 		Success:   true,
 		JobID:     jobID,
@@ -317,14 +317,14 @@ func handleGetJobStatus(c *fiber.Ctx) error {
 			Error:   "Job ID required",
 		})
 	}
-	
+
 	if globalJobQueue == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(OCRResponse{
 			Success: false,
 			Error:   "Job queue not initialized",
 		})
 	}
-	
+
 	result := globalJobQueue.getJobStatus(jobID)
 	return c.JSON(result)
 }
@@ -415,13 +415,13 @@ func recordSuccess() {
 func initOCRPool() {
 	// Use fewer workers to leave CPU for multiple concurrent requests
 	workers := 2 // Conservative for scalability
-	
+
 	if w := os.Getenv("OCR_WORKERS"); w != "" {
 		if v, err := strconv.Atoi(w); err == nil && v > 0 {
 			workers = v
 		}
 	}
-	
+
 	// Don't exceed 4 workers to avoid CPU saturation
 	if workers > 4 {
 		workers = 4

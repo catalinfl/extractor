@@ -48,7 +48,7 @@ func main() {
 	app.Post("/extract", handleExtractJSON)
 	app.Post("/extract/text", handleExtractText)
 	app.Post("/extract/ocr", handleExtractOCR)
-	
+
 	// Async OCR endpoints for scalability
 	app.Post("/extract/ocr/async", handleExtractOCRAsync)
 	app.Get("/extract/ocr/status/:jobId", handleGetJobStatus)
@@ -58,10 +58,10 @@ func main() {
 	if port == "" {
 		port = "3000"
 	}
-	
+
 	// Initialize job queue system
 	initJobQueue()
-	
+
 	app.Listen(":" + port)
 }
 
