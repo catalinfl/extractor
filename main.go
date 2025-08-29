@@ -17,7 +17,6 @@ type ExtractResponse struct {
 	NumPages int      `json:"num_pages,omitempty"`
 	Pages    []string `json:"pages,omitempty"`
 	Text     string   `json:"text,omitempty"`
-	OCRText  []string `json:"ocr_text,omitempty"`
 	Error    string   `json:"error,omitempty"`
 }
 
@@ -47,20 +46,12 @@ func main() {
 
 	app.Post("/extract", handleExtractJSON)
 	app.Post("/extract/text", handleExtractText)
-	app.Post("/extract/ocr", handleExtractOCR)
-
-	// Async OCR endpoints for scalability
-	app.Post("/extract/ocr/async", handleExtractOCRAsync)
-	app.Get("/extract/ocr/status/:jobId", handleGetJobStatus)
 
 	// Use PORT env var if present (Railway sets PORT)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
-
-	// Initialize job queue system
-	initJobQueue()
 
 	app.Listen(":" + port)
 }
