@@ -12,7 +12,7 @@ import (
 )
 
 func handleExtractJSON(c *fiber.Ctx) error {
-	fileData, fileType, err := getFileFromRequest(c)
+	fileData, fileType, filename, err := getFileFromRequest(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(ExtractResponse{
 			Success: false,
@@ -31,27 +31,43 @@ func handleExtractJSON(c *fiber.Ctx) error {
 	return c.JSON(ExtractResponse{
 		Success:  true,
 		FileType: fileType,
+		Filename: filename,
 		NumPages: len(pages),
 		Pages:    pages,
 	})
 }
 
-func getFileFromRequest(c *fiber.Ctx) ([]byte, string, error) {
+func getFileFromRequest(c *fiber.Ctx) ([]byte, string, string, error) {
 	// Try multipart form file first
 	fh, err := c.FormFile("file")
 	if err == nil && fh != nil {
-		return readMultipartFile(fh)
+		data, fileType, readErr := readMultipartFile(fh)
+		return data, fileType, fh.Filename, readErr
 	}
 
-	// Fallback to raw body
 	data := c.Body()
 	if len(data) == 0 {
-		return nil, "", fmt.Errorf("no file provided (use multipart field 'file' or send raw file body)")
+		return nil, "", "", fmt.Errorf("no file provided (use multipart field 'file' or send raw file body)")
+	}
+
+	// Try to get filename from headers
+	filename := "uploaded_file" // default fallback
+	if contentDisposition := c.Get("Content-Disposition"); contentDisposition != "" {
+		// Parse Content-Disposition header for filename
+		if idx := strings.Index(contentDisposition, "filename="); idx != -1 {
+			filename = strings.Trim(contentDisposition[idx+9:], "\"")
+		}
+	} else if xFilename := c.Get("X-Filename"); xFilename != "" {
+		// Check for custom X-Filename header
+		filename = xFilename
+	} else if originalName := c.Get("X-Original-Name"); originalName != "" {
+		// Check for X-Original-Name header
+		filename = originalName
 	}
 
 	// Detect file type from content
 	fileType := detectFileType(data)
-	return data, fileType, nil
+	return data, fileType, filename, nil
 }
 
 func readMultipartFile(fh *multipart.FileHeader) ([]byte, string, error) {

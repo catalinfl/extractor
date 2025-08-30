@@ -82,7 +82,9 @@ func extractDOCText(data []byte) ([]string, error) {
 	if text == "" {
 		return nil, fmt.Errorf("no readable text found in DOC file")
 	}
-	return []string{text}, nil
+
+	// Split into logical pages
+	return splitTextIntoPages(text), nil
 }
 
 func extractDOCXText(data []byte) ([]string, error) {
@@ -115,7 +117,8 @@ func extractDOCXText(data []byte) ([]string, error) {
 
 	text := extractTextFromXML(string(documentXML))
 
-	return []string{text}, nil
+	// Split into logical pages based on content length or page breaks
+	return splitTextIntoPages(text), nil
 }
 
 func extractPDFText(data []byte) ([]string, error) {
@@ -171,7 +174,7 @@ func extractPDFText(data []byte) ([]string, error) {
 	return pages, nil
 }
 
-// ODT Extractor => ALL TEXT NO CHUNK
+// ODT Extractor => Split into pages
 func extractODTText(data []byte) ([]string, error) {
 	// ODT is a ZIP archive with content.xml containing the text
 	r := bytes.NewReader(data)
@@ -204,8 +207,8 @@ func extractODTText(data []byte) ([]string, error) {
 	// Simple XML text extraction (removes tags)
 	text := extractTextFromXML(string(contentXML))
 
-	// For ODT, we'll return the entire content as one "page"
-	return []string{text}, nil
+	// Split into logical pages
+	return splitTextIntoPages(text), nil
 }
 
 func extractTextFromXML(xmlContent string) string {
@@ -240,4 +243,108 @@ func extractTextFromXML(xmlContent string) string {
 	}
 
 	return strings.Join(cleanLines, "\n")
+}
+
+// splitTextIntoPages splits a long text into logical pages
+// Based on content length and natural breaks like double newlines
+func splitTextIntoPages(text string) []string {
+	if strings.TrimSpace(text) == "" {
+		return []string{""}
+	}
+
+	// First, try to split by explicit page breaks or form feeds
+	if strings.Contains(text, "\f") {
+		pages := strings.Split(text, "\f")
+		var result []string
+		for _, page := range pages {
+			page = strings.TrimSpace(page)
+			if page != "" {
+				result = append(result, page)
+			}
+		}
+		if len(result) > 0 {
+			return result
+		}
+	}
+
+	// Split by multiple newlines (paragraph breaks) as page separators
+	paragraphs := strings.Split(text, "\n\n")
+
+	// If we have many short paragraphs, group them into pages
+	const maxCharsPerPage = 2000
+
+	var pages []string
+	var currentPage strings.Builder
+
+	for _, paragraph := range paragraphs {
+		paragraph = strings.TrimSpace(paragraph)
+		if paragraph == "" {
+			continue
+		}
+
+		// If adding this paragraph would make the page too long, start a new page
+		if currentPage.Len() > 0 && currentPage.Len()+len(paragraph) > maxCharsPerPage {
+			pages = append(pages, strings.TrimSpace(currentPage.String()))
+			currentPage.Reset()
+		}
+
+		if currentPage.Len() > 0 {
+			currentPage.WriteString("\n\n")
+		}
+		currentPage.WriteString(paragraph)
+	}
+
+	// Add the last page if it has content
+	if currentPage.Len() > 0 {
+		pages = append(pages, strings.TrimSpace(currentPage.String()))
+	}
+
+	// If we ended up with no pages or very few, try a different approach
+	if len(pages) == 0 {
+		return []string{text}
+	}
+
+	// If we have only one page but it's very long, split it by sentences
+	if len(pages) == 1 && len(pages[0]) > maxCharsPerPage*2 {
+		return splitByLength(pages[0], maxCharsPerPage)
+	}
+
+	return pages
+}
+
+// splitByLength splits text into chunks of approximately maxLength characters
+// trying to break at sentence or paragraph boundaries
+func splitByLength(text string, maxLength int) []string {
+	if len(text) <= maxLength {
+		return []string{text}
+	}
+
+	var pages []string
+	remaining := text
+
+	for len(remaining) > maxLength {
+		// Find a good break point near maxLength
+		breakPoint := maxLength
+
+		// Look for paragraph break first
+		if idx := strings.LastIndex(remaining[:breakPoint], "\n\n"); idx > maxLength/2 {
+			breakPoint = idx
+		} else if idx := strings.LastIndex(remaining[:breakPoint], ". "); idx > maxLength/2 {
+			// Look for sentence break
+			breakPoint = idx + 1
+		} else if idx := strings.LastIndex(remaining[:breakPoint], " "); idx > maxLength/2 {
+			// Look for word break
+			breakPoint = idx
+		}
+
+		pages = append(pages, strings.TrimSpace(remaining[:breakPoint]))
+		remaining = strings.TrimSpace(remaining[breakPoint:])
+	}
+
+	// Add the remaining text as the last page
+	if len(remaining) > 0 {
+		pages = append(pages, remaining)
+	}
+
+	return pages
 }
