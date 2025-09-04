@@ -11,7 +11,9 @@ import (
 )
 
 const OpenRouterAPIURL = "https://openrouter.ai/api/v1/chat/completions"
-const OpenRouterModel = "google/gemini-flash-1.5-8b"
+
+// const OpenRouterModel = "google/gemini-flash-1.5-8b"
+const OpenRouterModel = "google/gemini-2.0-flash-001"
 
 // OpenRouter API structures
 type OpenRouterMessage struct {
@@ -53,22 +55,87 @@ type KeywordExtractionResult struct {
 	Language string `json:"language"`
 }
 
-// answerFromVectorDB - Răspunde la întrebări pe baza JSON-ului din Qdrant
-func answerFromVectorDB(question string, openRouterAnswerLanguage string, vectorDBResults string) (string, error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
+// AnswerResult - Structura pentru rezultatul răspunsului AI
+type AnswerResult struct {
+	Answer      string `json:"answer"`
+	FoundAnswer bool   `json:"foundAnswer"`
+}
+
+// sanitizeJSONString escapes raw control characters (newline, carriage return, tab)
+// that may appear unescaped inside JSON string literals returned by the model.
+// It walks the input and only replaces these characters when inside a quoted string.
+func sanitizeJSONString(s string) string {
+	var b strings.Builder
+	inString := false
+	prevBackslash := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if c == '"' && !prevBackslash {
+			inString = !inString
+			b.WriteByte(c)
+			prevBackslash = false
+			continue
+		}
+
+		if inString {
+			if c == '\n' {
+				b.WriteString("\\n")
+				prevBackslash = false
+				continue
+			}
+			if c == '\r' {
+				b.WriteString("\\r")
+				prevBackslash = false
+				continue
+			}
+			if c == '\t' {
+				b.WriteString("\\t")
+				prevBackslash = false
+				continue
+			}
+			// handle backslash state
+			if c == '\\' && !prevBackslash {
+				prevBackslash = true
+				b.WriteByte(c)
+				continue
+			}
+			// if previous byte was backslash, reset state after consuming
+			if prevBackslash {
+				prevBackslash = false
+				b.WriteByte(c)
+				continue
+			}
+
+			b.WriteByte(c)
+			continue
+		}
+
+		// outside string, just copy
+		b.WriteByte(c)
+		prevBackslash = false
 	}
 
-	prompt := fmt.Sprintf(`Îți trimit fragmente din vectorDB bazate pe întrebarea aceasta. Trebuie să răspunzi la întrebare DOAR pe baza informațiilor din JSON.
+	return b.String()
+}
 
+// answerFromVectorDB - Răspunde la întrebări pe baza JSON-ului din Qdrant
+func answerFromVectorDB(question string, openRouterAnswerLanguage string, vectorDBResults string) (*AnswerResult, error) {
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
+	}
+
+	prompt := fmt.Sprintf(`Îți trimit fragmente din vectorDB bazate pe întrebarea aceasta. Trebuie să răspunzi la întrebare pe baza informațiilor din JSON.
+FOARTE IMPORTANT - NU MENTIONA DE VECTORDB. POTI MENTIONA DOAR CA NU AI GASIT IN DOCUMENTE, TE REFERI LA DOCUMENTE, NICIODATA LA VECTORDB, DAR NU REPETA LA FIECARE PROPOZITIE DOCUMENTE, VORBESTE IMPRESIONAL, PROFESIONIST
 FOARTE IMPORTANT - LIMBA RĂSPUNSULUI: %s
+FOARTE IMPORTANT - RASPUNSUL TREBUIE SA FIE NUANȚAT, PROFESIONIST, COMPLET ȘI DETALIAT.
 
 Dacă limba detectată este "romanian":
 - Răspunsul TREBUIE să fie în română completă
 - Folosește diacritice corecte (ă, î, â, ș, ț)
 - Exemplu de început: "Pe baza documentelor furnizate, pot să spun că..."
-- NU răspunde în engleză
 
 Dacă limba detectată este "english":
 - Răspunsul TREBUIE să fie în engleză
@@ -76,18 +143,22 @@ Dacă limba detectată este "english":
 
 Question: %s
 
-Vreau ca răspunsul să fie foarte profesional și dezvoltat. Răspunde DOAR în limba specificată mai sus.
+Analizează dacă informațiile din vectorDB pot răspunde la întrebare. Returneaza DOAR un JSON în următorul format (fără markdown):
+
+{
+  "answer": "răspunsul tău profesional în limba specificată",
+  "foundAnswer": true/false (true dacă ai găsit informații relevante, false dacă nu),
+}
 
 VectorDB Results (JSON):
 %s`, openRouterAnswerLanguage, question, vectorDBResults)
 
 	reqBody := OpenRouterRequest{
-		Model:       OpenRouterModel,
-		Temperature: 0.2,
+		Model: OpenRouterModel,
 		Messages: []OpenRouterMessage{
 			{
 				Role:    "system",
-				Content: fmt.Sprintf("Tu ești un asistent care răspunde strict în limba specificată. Dacă limba este 'romanian', răspunzi DOAR în română cu diacritice. Dacă limba este 'english', răspunzi DOAR în engleză. Limba pentru acest răspuns: %s", openRouterAnswerLanguage),
+				Content: fmt.Sprintf("Tu ești un asistent care răspunde strict în limba specificată și returnează JSON. Limba: %s", openRouterAnswerLanguage),
 			},
 			{
 				Role:    "user",
@@ -96,7 +167,27 @@ VectorDB Results (JSON):
 		},
 	}
 
-	return callOpenRouter(reqBody, apiKey)
+	responseStr, err := callOpenRouter(reqBody, apiKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// Clean the response - remove markdown code blocks if present
+	cleanResponse := strings.TrimSpace(responseStr)
+	cleanResponse = strings.TrimPrefix(cleanResponse, "```json")
+	cleanResponse = strings.TrimSuffix(cleanResponse, "```")
+	cleanResponse = strings.ReplaceAll(cleanResponse, "```", "")
+	cleanResponse = strings.TrimSpace(cleanResponse)
+
+	// Parse JSON response (sanitize unescaped control chars first)
+	var result AnswerResult
+	sanitized := sanitizeJSONString(cleanResponse)
+	err = json.Unmarshal([]byte(sanitized), &result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse AI response as JSON: %v. Response was: %s", err, cleanResponse)
+	}
+
+	return &result, nil
 }
 
 // extractKeywords - Extrage cuvinte cheie din întrebare pentru căutare în Qdrant
@@ -151,24 +242,15 @@ INTREBARE:
 
 	// Clean the response - remove markdown code blocks if present
 	cleanResponse := strings.TrimSpace(responseStr)
-	
-	// Remove ```json at the beginning
-	if strings.HasPrefix(cleanResponse, "```json") {
-		cleanResponse = strings.TrimPrefix(cleanResponse, "```json")
-	}
-	
-	// Remove ``` at the end
-	if strings.HasSuffix(cleanResponse, "```") {
-		cleanResponse = strings.TrimSuffix(cleanResponse, "```")
-	}
-	
-	// Remove any remaining ``` patterns
+	cleanResponse = strings.TrimPrefix(cleanResponse, "```json")
+	cleanResponse = strings.TrimSuffix(cleanResponse, "```")
 	cleanResponse = strings.ReplaceAll(cleanResponse, "```", "")
 	cleanResponse = strings.TrimSpace(cleanResponse)
 
-	// Parse JSON response
+	// Parse JSON response (sanitize unescaped control chars first)
 	var result KeywordExtractionResult
-	err = json.Unmarshal([]byte(cleanResponse), &result)
+	sanitized := sanitizeJSONString(cleanResponse)
+	err = json.Unmarshal([]byte(sanitized), &result)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse AI response as JSON: %v. Response was: %s", err, cleanResponse)
 	}

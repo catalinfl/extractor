@@ -6,10 +6,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 
-	"github.com/ledongthuc/pdf"
+	"github.com/gen2brain/go-fitz"
 )
 
 // extractDOCText attempts a best-effort extraction from legacy MS Word .doc (CFBF/OLE) files
@@ -122,56 +124,177 @@ func extractDOCXText(data []byte) ([]string, error) {
 }
 
 func extractPDFText(data []byte) ([]string, error) {
-	r := bytes.NewReader(data)
-
-	reader, err := pdf.NewReader(r, int64(len(data)))
+	// Create a document from PDF data using go-fitz (MuPDF)
+	doc, err := fitz.NewFromMemory(data)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open PDF: %v", err)
+		return nil, fmt.Errorf("cannot open PDF with MuPDF: %v", err)
 	}
+	defer doc.Close()
 
-	totalPages := reader.NumPage()
+	totalPages := doc.NumPage()
 	pages := make([]string, 0, totalPages)
 
-	for pageNum := 1; pageNum <= totalPages; pageNum++ {
-		page := reader.Page(pageNum)
-		if page.V.IsNull() {
+	for pageNum := 0; pageNum < totalPages; pageNum++ {
+		// Extract text from the page using MuPDF
+		text, err := doc.Text(pageNum)
+		if err != nil {
+			// If text extraction fails, try alternative methods
+			fmt.Printf("Warning: Failed to extract text from page %d: %v\n", pageNum+1, err)
 			pages = append(pages, "")
 			continue
 		}
 
-		rows, err := page.GetTextByRow()
-		if err != nil {
-			// Fallback: try to extract text manually if GetTextByRow fails
-			content := page.Content()
-			var sb strings.Builder
-			for _, text := range content.Text {
-				sb.WriteString(text.S)
-				sb.WriteByte(' ')
-			}
-			pages = append(pages, strings.TrimSpace(sb.String()))
-			continue
-		}
+		// Clean the extracted text
+		cleanedText := cleanUnicodeText(text)
 
-		var pageLines []string
-		for _, row := range rows {
-			var rowText strings.Builder
-			for i, word := range row.Content {
-				if i > 0 {
-					rowText.WriteByte(' ')
-				}
-				rowText.WriteString(word.S)
-			}
-			if rowText.Len() > 0 {
-				pageLines = append(pageLines, strings.TrimSpace(rowText.String()))
-			}
+		if strings.TrimSpace(cleanedText) != "" {
+			pages = append(pages, cleanedText)
 		}
-
-		pageText := strings.Join(pageLines, "\n")
-		pageText = strings.TrimSpace(pageText)
-		pages = append(pages, pageText)
 	}
 
-	return pages, nil
+	// Filter out empty pages
+	var nonEmptyPages []string
+	for _, page := range pages {
+		if strings.TrimSpace(page) != "" {
+			nonEmptyPages = append(nonEmptyPages, page)
+		}
+	}
+
+	return nonEmptyPages, nil
+}
+
+// cleanExtractedText - Curăță textul extras pentru a îmbunătăți calitatea
+func cleanExtractedText(text string) string {
+	// Remove excessive whitespace but preserve structure
+	lines := strings.Split(text, "\n")
+	var cleanLines []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			// Remove excessive spaces within lines
+			words := strings.Fields(line)
+			cleanLine := strings.Join(words, " ")
+			cleanLines = append(cleanLines, cleanLine)
+		}
+	}
+
+	return strings.Join(cleanLines, "\n")
+}
+
+// cleanUnicodeText - Curăță text Unicode corupt (caractere separate prin spații)
+func cleanUnicodeText(text string) string {
+	if text == "" {
+		return text
+	}
+
+	// Remove zero-width spaces and other invisible characters
+	text = strings.ReplaceAll(text, "\u200B", "") // Zero-width space
+	text = strings.ReplaceAll(text, "\u200C", "") // Zero-width non-joiner
+	text = strings.ReplaceAll(text, "\u200D", "") // Zero-width joiner
+	text = strings.ReplaceAll(text, "\uFEFF", "") // Byte order mark
+
+	// Fix common issue: characters separated by spaces in RTL languages
+	if isRTLText(text) {
+		text = fixRTLSpacing(text)
+	}
+
+	// Fix excessive spaces
+	re := regexp.MustCompile(`\s+`)
+	text = re.ReplaceAllString(text, " ")
+
+	return strings.TrimSpace(text)
+}
+
+// isCorruptedText - Detectează dacă textul este corupt (prea multe spații între caractere)
+func isCorruptedText(text string) bool {
+	if text == "" {
+		return false
+	}
+
+	// Count spaces vs non-space characters
+	spaceCount := 0
+	nonSpaceCount := 0
+
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			spaceCount++
+		} else if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			nonSpaceCount++
+		}
+	}
+
+	// If we have more spaces than letters/digits, likely corrupted
+	return nonSpaceCount > 0 && float64(spaceCount)/float64(nonSpaceCount) > 2.0
+}
+
+// isRTLText - Detectează dacă textul conține caractere RTL (Right-to-Left)
+func isRTLText(text string) bool {
+	rtlCount := 0
+	totalLetters := 0
+
+	for _, r := range text {
+		if unicode.IsLetter(r) {
+			totalLetters++
+			if isRTLCharacter(r) {
+				rtlCount++
+			}
+		}
+	}
+
+	// If more than 50% are RTL characters
+	return totalLetters > 0 && float64(rtlCount)/float64(totalLetters) > 0.5
+}
+
+// isRTLCharacter - Verifică dacă un caracter este RTL
+func isRTLCharacter(r rune) bool {
+	// Hebrew: U+0590-U+05FF
+	if r >= 0x0590 && r <= 0x05FF {
+		return true
+	}
+	// Arabic: U+0600-U+06FF, U+0750-U+077F, U+08A0-U+08FF
+	if (r >= 0x0600 && r <= 0x06FF) || (r >= 0x0750 && r <= 0x077F) || (r >= 0x08A0 && r <= 0x08FF) {
+		return true
+	}
+	// Arabic Supplement: U+0750-U+077F
+	// Arabic Extended-A: U+08A0-U+08FF
+	return false
+}
+
+// fixRTLSpacing - Încearcă să repare spațiile în exces în textul RTL
+func fixRTLSpacing(text string) string {
+	// Split into words and try to reconstruct
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return text
+	}
+
+	var fixedWords []string
+	var currentWord strings.Builder
+
+	for _, word := range words {
+		// If word is a single character and RTL, might be part of a larger word
+		if len([]rune(word)) == 1 && isRTLCharacter([]rune(word)[0]) {
+			currentWord.WriteString(word)
+		} else {
+			// Add accumulated characters as one word
+			if currentWord.Len() > 0 {
+				fixedWords = append(fixedWords, currentWord.String())
+				currentWord.Reset()
+			}
+			// Add the current word if it's not empty
+			if strings.TrimSpace(word) != "" {
+				fixedWords = append(fixedWords, word)
+			}
+		}
+	}
+
+	// Don't forget the last accumulated word
+	if currentWord.Len() > 0 {
+		fixedWords = append(fixedWords, currentWord.String())
+	}
+
+	return strings.Join(fixedWords, " ")
 }
 
 // ODT Extractor => Split into pages

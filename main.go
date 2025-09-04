@@ -78,6 +78,19 @@ func main() {
 	// Smart search: Extract keywords + Search + AI answer in one request
 	app.Post("/smart-search", handleSmartSearch)
 
+	// SUMMARY ROUTES - 3 TIPURI SEPARATE
+	// 1. Rezumat pe capitole (primește tot PDF-ul)
+	app.Post("/summary/chapters", handleChapterSummary)
+	app.Post("/summary/chapters/download", handleDownloadChapterSummaryPDF)
+
+	// 2. Rezumat general (o linie sau o pagină)
+	app.Post("/summary/general", handleGeneralSummary)
+	app.Post("/summary/general/download", handleDownloadGeneralSummaryPDF)
+
+	// 3. Rezumat pe nivele (user alege nivelul 1-10)
+	app.Post("/summary/level", handleLevelSummary)
+	app.Post("/summary/level/download", handleDownloadLevelSummaryPDF)
+
 	// Use PORT env var if present (Railway sets PORT)
 	port := os.Getenv("PORT")
 	if port == "" {
