@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 const OpenRouterAPIURL = "https://openrouter.ai/api/v1/chat/completions"
@@ -265,7 +267,11 @@ func callOpenRouter(reqBody OpenRouterRequest, apiKey string) (string, error) {
 		return "", fmt.Errorf("failed to marshal request: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", OpenRouterAPIURL, bytes.NewBuffer(payload))
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", OpenRouterAPIURL, bytes.NewBuffer(payload))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %v", err)
 	}
@@ -275,10 +281,20 @@ func callOpenRouter(reqBody OpenRouterRequest, apiKey string) (string, error) {
 	req.Header.Set("HTTP-Referer", "https://github.com/catalinfl/pdf-response")
 	req.Header.Set("X-Title", "PDF Response Tool")
 
-	client := &http.Client{}
+	// Client with timeout
+	client := &http.Client{
+		Timeout: 35 * time.Second, // Slightly higher than context timeout
+	}
+
+	startTime := time.Now()
 	resp, err := client.Do(req)
+	apiCallDuration := time.Since(startTime)
+
 	if err != nil {
-		return "", fmt.Errorf("failed to call OpenRouter API: %v", err)
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("OpenRouter API call timeout after %v", apiCallDuration)
+		}
+		return "", fmt.Errorf("failed to call OpenRouter API: %v (took %v)", err, apiCallDuration)
 	}
 	defer resp.Body.Close()
 

@@ -79,15 +79,15 @@ func main() {
 	app.Post("/smart-search", handleSmartSearch)
 
 	// SUMMARY ROUTES - 3 TIPURI SEPARATE
-	// 1. Rezumat pe capitole (primește tot PDF-ul)
+	// Chapter summary (receives full PDF)
 	app.Post("/summary/chapters", handleChapterSummary)
 	app.Post("/summary/chapters/download", handleDownloadChapterSummaryPDF)
 
-	// 2. Rezumat general (o linie sau o pagină)
+	// General summary (receive all pages, return small summary)
 	app.Post("/summary/general", handleGeneralSummary)
 	app.Post("/summary/general/download", handleDownloadGeneralSummaryPDF)
 
-	// 3. Rezumat pe nivele (user alege nivelul 1-10)
+	// Advanced summary, with levels
 	app.Post("/summary/level", handleLevelSummary)
 	app.Post("/summary/level/download", handleDownloadLevelSummaryPDF)
 

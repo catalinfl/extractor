@@ -35,9 +35,8 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/jung-kurt/gofpdf"
 )
 
 // SummaryLevel reprezintă un nivel de rezumat
@@ -72,46 +71,78 @@ type SummaryRequest struct {
 	TotalPages      int    `json:"total_pages"`
 	Language        string `json:"language,omitempty"`
 	IncludeChapters bool   `json:"include_chapters,omitempty"`
+	DesiredLevel    int    `json:"desired_level,omitempty"` // 1..10, if 0 -> all levels
 }
 
 // calculateSummaryLevels calculează configurarea pentru fiecare nivel
-func calculateSummaryLevels(totalPages int) []SummaryLevel {
-	levels := make([]SummaryLevel, 10)
-
-	// Nivel 1: 3 pagini per chunk (cel mai general)
-	levels[0] = SummaryLevel{
-		Level:         1,
-		Description:   "Rezumat foarte general (3 pagini per chunk)",
-		PagesPerChunk: 3,
+func calculateSummaryLevels(totalPages int, desiredLevel int) SummaryLevel {
+	// Clamp desiredLevel to maximum 4
+	if desiredLevel <= 0 {
+		desiredLevel = 1
+	}
+	if desiredLevel > 4 {
+		desiredLevel = 4
 	}
 
-	// Niveluri 2-9: progresiv mai detaliate
-	for i := 1; i < 9; i++ {
-		pagesPerChunk := int(math.Max(3, float64(totalPages)/math.Pow(2, float64(10-i))))
-		levels[i] = SummaryLevel{
-			Level:         i + 1,
-			Description:   fmt.Sprintf("Rezumat nivel %d (%d pagini per chunk)", i+1, pagesPerChunk),
+	makeLevel := func(level int) SummaryLevel {
+		var pagesPerChunk int
+
+		// Strategii diferite în funcție de numărul total de pagini (păstrăm comportamentul pentru nivelele 1..4)
+		if totalPages <= 20 {
+			switch level {
+			case 1:
+				pagesPerChunk = int(math.Max(1, float64(totalPages)/2))
+			case 4:
+				pagesPerChunk = int(math.Max(1, float64(totalPages)/4))
+			default:
+				ratio := float64(level-1) / 3
+				pagesPerChunk = int(math.Max(1, float64(totalPages)*(0.1+ratio*0.4)))
+			}
+		} else if totalPages <= 100 {
+			switch level {
+			case 1:
+				pagesPerChunk = int(math.Max(3, float64(totalPages)/3))
+			case 4:
+				pagesPerChunk = int(math.Max(3, float64(totalPages)/8))
+			default:
+				chunksTarget := 3 + (level - 1)
+				pagesPerChunk = int(math.Max(2, float64(totalPages)/float64(chunksTarget)))
+			}
+		} else {
+			switch level {
+			case 1:
+				pagesPerChunk = int(math.Max(5, float64(totalPages)/5))
+			case 2:
+				pagesPerChunk = int(math.Max(4, float64(totalPages)/8))
+			case 3:
+				pagesPerChunk = int(math.Max(3, float64(totalPages)/12))
+			case 4:
+				pagesPerChunk = int(math.Max(3, float64(totalPages)/15))
+			}
+		}
+
+		if pagesPerChunk > totalPages {
+			pagesPerChunk = totalPages
+		}
+
+		estimatedChunks := int(math.Ceil(float64(totalPages) / float64(pagesPerChunk)))
+
+		return SummaryLevel{
+			Level:         level,
+			Description:   fmt.Sprintf("Rezumat nivel %d (%d pagini per chunk, ~%d chunks)", level, pagesPerChunk, estimatedChunks),
 			PagesPerChunk: pagesPerChunk,
 		}
 	}
 
-	// Nivel 10: cel mai detaliat (20 pagini per chunk pentru 400+ pagini)
-	pagesPerChunk := 20
-	if totalPages < 100 {
-		pagesPerChunk = int(math.Max(5, float64(totalPages)/10))
-	}
-	levels[9] = SummaryLevel{
-		Level:         10,
-		Description:   fmt.Sprintf("Rezumat foarte detaliat (%d pagini per chunk)", pagesPerChunk),
-		PagesPerChunk: pagesPerChunk,
-	}
-
-	return levels
+	return makeLevel(desiredLevel)
 }
 
 // chunkTextByPages împarte textul în chunk-uri bazate pe numărul de pagini
 func chunkTextByPages(text string, totalPages int, pagesPerChunk int) []string {
+	startTime := time.Now()
+
 	if totalPages <= 0 || pagesPerChunk <= 0 {
+		fmt.Printf("⏱️ chunkTextByPages: Invalid params, returning single chunk (took: %v)\n", time.Since(startTime))
 		return []string{text}
 	}
 
@@ -119,7 +150,11 @@ func chunkTextByPages(text string, totalPages int, pagesPerChunk int) []string {
 	avgCharsPerPage := len(text) / totalPages
 	chunkSize := avgCharsPerPage * pagesPerChunk
 
+	fmt.Printf("📊 chunkTextByPages: text=%d chars, pages=%d, pagesPerChunk=%d, avgCharsPerPage=%d, chunkSize=%d\n",
+		len(text), totalPages, pagesPerChunk, avgCharsPerPage, chunkSize)
+
 	if chunkSize >= len(text) {
+		fmt.Printf("⏱️ chunkTextByPages: Single chunk needed (took: %v)\n", time.Since(startTime))
 		return []string{text}
 	}
 
@@ -131,27 +166,41 @@ func chunkTextByPages(text string, totalPages int, pagesPerChunk int) []string {
 		}
 
 		chunk := text[i:end]
-		// Încearcă să termine la sfârșitul unei propoziții
+
+		// Optimized sentence boundary detection - limit search to last 500 chars to avoid performance issues
 		if end < len(text) {
-			lastDot := strings.LastIndex(chunk, ".")
-			lastQuestion := strings.LastIndex(chunk, "?")
-			lastExclamation := strings.LastIndex(chunk, "!")
+			searchStart := len(chunk) - 500
+			if searchStart < len(chunk)/2 {
+				searchStart = len(chunk) / 2
+			}
+
+			searchChunk := chunk[searchStart:]
+			lastDot := strings.LastIndex(searchChunk, ".")
+			lastQuestion := strings.LastIndex(searchChunk, "?")
+			lastExclamation := strings.LastIndex(searchChunk, "!")
 
 			lastSentenceEnd := int(math.Max(float64(lastDot), math.Max(float64(lastQuestion), float64(lastExclamation))))
-			if lastSentenceEnd > len(chunk)/2 { // Dacă găsim sfârșitul unei propoziții în a doua jumătate
-				chunk = chunk[:lastSentenceEnd+1]
-				i = i + lastSentenceEnd + 1 - chunkSize // Ajustează indexul
+			if lastSentenceEnd > 0 {
+				actualEnd := searchStart + lastSentenceEnd + 1
+				chunk = chunk[:actualEnd]
+				i = i + actualEnd - chunkSize // adjust index
 			}
 		}
 
 		chunks = append(chunks, strings.TrimSpace(chunk))
 	}
 
+	duration := time.Since(startTime)
+	fmt.Printf("⏱️ chunkTextByPages: Created %d chunks in %v\n", len(chunks), duration)
+
 	return chunks
 }
 
-// generateChunkSummary generează rezumatul pentru un chunk de text - PENTRU NIVELURI (1-10)
-func generateChunkSummary(chunk string, chunkIndex int, totalChunks int, level int, language string) (string, error) {
+func generateChunkSummary(chunk string, chunkIndex int, totalChunks int, language string) (string, error) {
+	startTime := time.Now()
+
+	fmt.Printf("⏱️ [Chunk %d/%d] Starting chunk summary generation (%d chars)...\n", chunkIndex+1, totalChunks, len(chunk))
+
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
 	if apiKey == "" {
 		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
@@ -159,31 +208,29 @@ func generateChunkSummary(chunk string, chunkIndex int, totalChunks int, level i
 
 	prompt := fmt.Sprintf(`Ești un expert în rezumarea textelor. Fă un rezumat profesional al acestui CHUNK de text.
 
-ATENȚIE: Primești un FRAGMENT (chunk %d din %d) din PDF, NU întreg documentul!
+ATENȚIE: Primești o PARTE (chunk %d din %d) dintr-un document mai mare pentru rezumat!
 
 INFORMAȚII CONTEXT:
-- Chunk %d din %d (fragment din PDF)
-- Nivel de detaliu: %d (1=foarte general, 10=foarte detaliat)
-- Limba: %s
+- Acesta este chunk-ul %d din %d pentru rezumat
+- Limba: %s FOARTE FOARTE IMPORTANT!
 
-INSTRUCȚIUNI REZUMAT PENTRU NIVELURI:
-- Pentru nivel 1-3: Rezumat foarte concis, doar ideile principale din acest chunk
-- Pentru nivel 4-6: Rezumat moderat, include detalii importante din acest chunk
-- Pentru nivel 7-10: Rezumat detaliat, păstrează informații specifice din acest chunk
+INSTRUCȚIUNI IMPORTANTE:
+- Acesta este UN FRAGMENT din rezumatul complet
+- Rezumatul tău va fi UNIT direct cu alte chunk-uri (FĂRĂ procesare suplimentară)
+- Incearca sa-l faci cat mai detaliat
+- Scrie fluent și coerent pentru că va fi unit cu alte părți
+- NU folosi introduceri ca "În acest fragment..." sau "Această parte..."
+- Începe direct cu conținutul relevant
 
-IMPORTANT: Rezumă DOAR conținutul din acest chunk, fără a presupune context din alte părți!
+LIMBA: %s FOARTE FOARTE IMPORTANT!
 
-LIMBA: %s (folosește diacritice corecte pentru română)
-
-Returnează DOAR rezumatul chunk-ului, fără introduceri sau explicații.
-
-CHUNK DE REZUMAT:
-%s`, chunkIndex+1, totalChunks, chunkIndex+1, totalChunks, level, language, language, chunk)
+TEXT CHUNK:
+%s`, chunkIndex+1, totalChunks, chunkIndex+1, totalChunks, language, language, chunk)
 
 	reqBody := OpenRouterRequest{
 		Model:       OpenRouterModel,
 		Temperature: 0.3,
-		MaxTokens:   1000,
+		MaxTokens:   2000,
 		Messages: []OpenRouterMessage{
 			{
 				Role:    "system",
@@ -196,7 +243,13 @@ CHUNK DE REZUMAT:
 		},
 	}
 
+	startCall := time.Now()
 	summary, err := callOpenRouter(reqBody, apiKey)
+	callDuration := time.Since(startCall)
+	totalDuration := time.Since(startTime)
+
+	fmt.Printf("⏱️ [Chunk %d/%d] OpenRouter call took: %v, total chunk time: %v\n", chunkIndex+1, totalChunks, callDuration, totalDuration)
+
 	if err != nil {
 		return "", fmt.Errorf("failed to generate summary for chunk %d: %v", chunkIndex+1, err)
 	}
@@ -206,267 +259,180 @@ CHUNK DE REZUMAT:
 
 // generateLevelSummary generează rezumatul pentru un nivel specific
 func generateLevelSummary(text string, totalPages int, level SummaryLevel, language string) (string, error) {
-	fmt.Printf("📄 Generez rezumat pentru nivelul %d (%d pagini per chunk)...\n", level.Level, level.PagesPerChunk)
+	startTime := time.Now()
+	fmt.Printf("📄 [LEVEL %d] Starting level summary generation (%d pagini per chunk)...\n", level.Level, level.PagesPerChunk)
 
+	startChunking := time.Now()
 	chunks := chunkTextByPages(text, totalPages, level.PagesPerChunk)
-	fmt.Printf("📄 Împărțit în %d chunk-uri pentru nivelul %d\n", len(chunks), level.Level)
+	chunkingDuration := time.Since(startChunking)
+	fmt.Printf("⏱️ [LEVEL %d] Text chunking took: %v, created %d chunks\n", level.Level, chunkingDuration, len(chunks))
 
-	var summaries []string
+	// Process chunks in parallel with concurrency limit to avoid rate limiting
+	const maxConcurrency = 200
+	semaphore := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	summaries := make([]string, len(chunks))
+	errors := make([]error, len(chunks))
 
 	for i, chunk := range chunks {
-		fmt.Printf("📄 Procesez chunk %d/%d pentru nivelul %d...\n", i+1, len(chunks), level.Level)
+		wg.Add(1)
+		go func(index int, chunkText string) {
+			defer wg.Done()
 
-		summary, err := generateChunkSummary(chunk, i, len(chunks), level.Level, language)
-		if err != nil {
-			return "", err
-		}
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
-		summaries = append(summaries, summary)
+			fmt.Printf("📄 [LEVEL %d] Processing chunk %d/%d (size: %d chars) [PARALLEL]...\n", level.Level, index+1, len(chunks), len(chunkText))
+
+			chunkStart := time.Now()
+			summary, err := generateChunkSummary(chunkText, index, len(chunks), language)
+			chunkDuration := time.Since(chunkStart)
+
+			if err != nil {
+				fmt.Printf("❌ [LEVEL %d] Error processing chunk %d: %v (took: %v)\n", level.Level, index+1, err, chunkDuration)
+				errors[index] = err
+			} else {
+				fmt.Printf("⏱️ [LEVEL %d] Chunk %d/%d completed in: %v [PARALLEL]\n", level.Level, index+1, len(chunks), chunkDuration)
+				summaries[index] = summary
+			}
+		}(i, chunk)
 	}
 
-	// Combinare rezumate chunk-uri într-un rezumat final pentru nivel
+	// Wait for all chunks to complete
+	fmt.Printf("⏳ [LEVEL %d] Waiting for all %d chunks to complete...\n", level.Level, len(chunks))
+	wg.Wait()
+
+	// Check for errors
+	for i, err := range errors {
+		if err != nil {
+			fmt.Printf("❌ [LEVEL %d] Failed at chunk %d: %v\n", level.Level, i+1, err)
+			return "", err
+		}
+	}
+
+	// Reunire directă a chunk-urilor FĂRĂ procesare suplimentară prin AI
 	if len(summaries) == 1 {
+		totalDuration := time.Since(startTime)
+		fmt.Printf("⏱️ [LEVEL %d] Single chunk completed in total: %v\n", level.Level, totalDuration)
 		return summaries[0], nil
 	}
 
-	combinedSummaries := strings.Join(summaries, "\n\n")
-	finalSummary, err := generateFinalSummaryForLevel(combinedSummaries, level.Level, language)
-	if err != nil {
-		return "", err
-	}
+	// Combină chunk-urile direct cu separatori
+	startCombining := time.Now()
+	fmt.Printf("📄 [LEVEL %d] Combining %d chunks directly without AI processing...\n", level.Level, len(summaries))
+	finalSummary := strings.Join(summaries, "\n\n")
+	combiningDuration := time.Since(startCombining)
+	totalDuration := time.Since(startTime)
+
+	fmt.Printf("⏱️ [LEVEL %d] Combining took: %v, total level processing: %v\n", level.Level, combiningDuration, totalDuration)
 
 	return finalSummary, nil
 }
 
-// generateFinalSummaryForLevel generează rezumatul final pentru un nivel
-func generateFinalSummaryForLevel(combinedSummaries string, level int, language string) (string, error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
-	}
-
-	prompt := fmt.Sprintf(`Ai primit mai multe rezumate parțiale pentru nivelul %d. Combină-le într-un rezumat coerent și complet.
-
-NIVEL: %d
-- Pentru nivel 1-3: Rezumat foarte concis
-- Pentru nivel 4-6: Rezumat echilibrat  
-- Pentru nivel 7-10: Rezumat detaliat
-
-LIMBA: %s
-
-Instrucțiuni:
-1. Combină informațiile într-un mod logic și coerent
-2. Elimină redundanțele
-3. Păstrează fluxul narativ
-4. Respectă nivelul de detaliu cerut
-
-REZUMATE DE COMBINAT:
-%s`, level, level, language, combinedSummaries)
-
-	reqBody := OpenRouterRequest{
-		Model:       OpenRouterModel,
-		Temperature: 0.2,
-		MaxTokens:   1500,
-		Messages: []OpenRouterMessage{
-			{
-				Role:    "system",
-				Content: fmt.Sprintf("Ești un expert în sinteza textelor în limba %s.", language),
-			},
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
-	}
-
-	finalSummary, err := callOpenRouter(reqBody, apiKey)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(finalSummary), nil
-}
-
-// detectChapters încearcă să detecteze capitolele din text
-func detectChapters(text string) []ChapterInfo {
-	// Simplă detecție bazată pe pattern-uri comune
-	var chapters []ChapterInfo
-
-	lines := strings.Split(text, "\n")
-	chapterNum := 1
-
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-
-		// Pattern-uri pentru capitole
-		if strings.Contains(strings.ToLower(line), "capitol") ||
-			strings.Contains(strings.ToLower(line), "chapter") ||
-			strings.HasPrefix(line, "Cap.") ||
-			strings.HasPrefix(line, "Ch.") {
-
-			chapters = append(chapters, ChapterInfo{
-				Number: chapterNum,
-				Title:  line,
-				Pages:  fmt.Sprintf("Pagina %d+", i/50+1), // Estimare
-			})
-			chapterNum++
-		}
-	}
-
-	return chapters
-}
-
-// generateChapterSummaries generează rezumate pentru capitole - PRIMEȘTE TOT TEXTUL PDF
+// generateChapterSummaries generates a list of chapters detected by AI and returns
+// a structured JSON: []ChapterInfo. It sends the LLM the entire text (text) and asks it
+// to detect the chapters, titles, page ranges (if possible), and a short summary
+// for each chapter. The function sanitizes the response and decodes it.
 func generateChapterSummaries(text string, language string) ([]ChapterInfo, error) {
-	fmt.Printf("📄 Detectez și generez rezumate pentru capitole...\n")
-
-	// Detectează capitolele
-	chapters := detectChapters(text)
-
-	if len(chapters) == 0 {
-		// Dacă nu găsim capitole, împărțim textul în secțiuni logice
-		return generateLogicalSections(text, language)
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
 	}
 
-	// Generează rezumate pentru fiecare capitol detectat
-	for i := range chapters {
-		summary, err := generateSingleChapterSummary(text, chapters[i], language)
-		if err != nil {
-			fmt.Printf("⚠️ Eroare la generarea rezumatului pentru capitolul %d: %v\n", chapters[i].Number, err)
-			chapters[i].Summary = "Eroare la generarea rezumatului"
-			continue
+	// Prompt requires a json response with {number,title,pages,summary}
+	prompt := fmt.Sprintf(`Ești un asistent care detectează capitolele și secțiunile dintr-un document.
+Returnează DOAR un ARRAY JSON (începând cu '[') cu obiecte având exact câmpurile:
+ - number (integer) -> numărul capitolului, în ordine
+ - title (string) -> titlul capitolului (dacă nu are titlu, pune "Capitolul N")
+ - pages (string) -> intervalul de pagini sau estimare (ex: "1-10")
+ - summary (string) -> rezumat scurt al capitolului (5-8 propoziții)
+
+Răspunde STRICT cu JSON, fără text explicativ, fără note, fără markdown.
+
+LIMBA IN CARE RASPUNZI: %s !FOARTE IMPORTANT
+
+TEXT COMPLET PDF (anexează tot textul următor):
+%s
+`, language, text)
+
+	reqBody := OpenRouterRequest{
+		Model:       OpenRouterModel,
+		Temperature: 0.3,
+		MaxTokens:   4000,
+		Messages: []OpenRouterMessage{
+			{
+				Role:    "system",
+				Content: fmt.Sprintf("Ești un expert care extrage capitole și rezumate din documente în limba %s. Returnezi doar JSON.", language),
+			},
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+	}
+
+	resp, err := callOpenRouter(reqBody, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call OpenRouter for chapters: %v", err)
+	}
+	// Normalize response: remove common code fences and stray backticks
+	raw := strings.TrimSpace(resp)
+	raw = strings.ReplaceAll(raw, "```json", "")
+	raw = strings.ReplaceAll(raw, "```", "")
+	raw = strings.Trim(raw, "` \n\r\t")
+	raw = strings.TrimSpace(raw)
+
+	// Attempt to extract JSON array between first '[' and last ']' or fallback to object between '{' and '}'
+	firstArray := strings.Index(raw, "[")
+	lastArray := strings.LastIndex(raw, "]")
+
+	var jsonPart string
+	if firstArray != -1 && lastArray != -1 && lastArray > firstArray {
+		jsonPart = raw[firstArray : lastArray+1]
+	} else {
+		// fallback: try a single object and wrap into array
+		firstObj := strings.Index(raw, "{")
+		lastObj := strings.LastIndex(raw, "}")
+		if firstObj != -1 && lastObj != -1 && lastObj > firstObj {
+			jsonPart = "[" + raw[firstObj:lastObj+1] + "]"
+		} else {
+			// give up extracting and use the whole cleaned raw
+			jsonPart = raw
 		}
-		chapters[i].Summary = summary
 	}
 
-	return chapters, nil
-}
-
-// generateLogicalSections împarte textul în secțiuni logice dacă nu sunt capitole
-func generateLogicalSections(text string, language string) ([]ChapterInfo, error) {
-	// Împarte textul în 3-5 secțiuni egale
-	sections := 4
-	textLen := len(text)
-	sectionSize := textLen / sections
+	// First attempt: sanitize JSON-friendly characters inside strings
+	sanitized := sanitizeJSONString(jsonPart)
 
 	var chapters []ChapterInfo
-
-	for i := 0; i < sections; i++ {
-		start := i * sectionSize
-		end := start + sectionSize
-		if i == sections-1 {
-			end = textLen // Ultima secțiune ia tot ce rămâne
+	if err := json.Unmarshal([]byte(sanitized), &chapters); err != nil {
+		if err2 := json.Unmarshal([]byte(jsonPart), &chapters); err2 == nil {
+		} else {
+			orig := strings.TrimSpace(resp)
+			orig = strings.ReplaceAll(orig, "```json", "")
+			orig = strings.ReplaceAll(orig, "```", "")
+			orig = strings.Trim(orig, "` \n\r\t")
+			if err3 := json.Unmarshal([]byte(orig), &chapters); err3 == nil {
+			} else {
+				return nil, fmt.Errorf("failed to decode chapters JSON: %v; response: %s", err, resp)
+			}
 		}
+	}
 
-		sectionText := text[start:end]
-
-		// Generează rezumat pentru secțiune
-		summary, err := generateSectionSummary(sectionText, i+1, language)
-		if err != nil {
-			summary = "Eroare la generarea rezumatului"
+	for i := range chapters {
+		if chapters[i].Number == 0 {
+			chapters[i].Number = i + 1
 		}
-
-		chapters = append(chapters, ChapterInfo{
-			Number:  i + 1,
-			Title:   fmt.Sprintf("Secțiunea %d", i+1),
-			Pages:   fmt.Sprintf("Secțiunea %d din %d", i+1, sections),
-			Summary: summary,
-		})
+		if strings.TrimSpace(chapters[i].Title) == "" {
+			chapters[i].Title = fmt.Sprintf("Capitolul %d", chapters[i].Number)
+		}
+		if strings.TrimSpace(chapters[i].Pages) == "" {
+			chapters[i].Pages = "n/a"
+		}
 	}
 
 	return chapters, nil
-}
-
-// generateSingleChapterSummary generează rezumatul pentru un capitol specific
-func generateSingleChapterSummary(fullText string, chapter ChapterInfo, language string) (string, error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
-	}
-
-	prompt := fmt.Sprintf(`Analizează ÎNTREG documentul PDF și fă un rezumat pentru capitolul/secțiunea specificată.
-
-ATENȚIE: Primești TOT TEXTUL PDF-ului și trebuie să identifici și să rezumi DOAR partea relevantă pentru:
-CAPITOLUL: %s (Numărul %d)
-
-LIMBA: %s (folosește diacritice corecte pentru română)
-
-Instrucțiuni pentru REZUMAT CAPITOL:
-- Identifică în textul complet partea care se referă la acest capitol
-- Fă un rezumat moderat (5-8 propoziții) DOAR pentru acest capitol
-- Concentrează-te pe ideile principale din acest capitol specific
-- NU incluzi informații din alte capitole
-- Stil profesional și clar
-
-TEXT COMPLET PDF:
-%s`, chapter.Title, chapter.Number, language, fullText)
-
-	reqBody := OpenRouterRequest{
-		Model:       OpenRouterModel,
-		Temperature: 0.3,
-		MaxTokens:   500,
-		Messages: []OpenRouterMessage{
-			{
-				Role:    "system",
-				Content: fmt.Sprintf("Ești un expert în analiza și rezumarea capitolelor din documente în limba %s.", language),
-			},
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
-	}
-
-	summary, err := callOpenRouter(reqBody, apiKey)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(summary), nil
-}
-
-// generateSectionSummary generează rezumatul pentru o secțiune logică
-func generateSectionSummary(sectionText string, sectionNum int, language string) (string, error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
-	}
-
-	prompt := fmt.Sprintf(`Fă un rezumat pentru această secțiune din document.
-
-SECȚIUNEA: %d
-LIMBA: %s (folosește diacritice corecte pentru română)
-
-Instrucțiuni:
-- Rezumat moderat (5-8 propoziții)
-- Identifică ideile principale din această secțiune
-- Stil profesional și clar
-
-TEXT SECȚIUNE:
-%s`, sectionNum, language, sectionText)
-
-	reqBody := OpenRouterRequest{
-		Model:       OpenRouterModel,
-		Temperature: 0.3,
-		MaxTokens:   400,
-		Messages: []OpenRouterMessage{
-			{
-				Role:    "system",
-				Content: fmt.Sprintf("Ești un expert în rezumarea secțiunilor de text în limba %s.", language),
-			},
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
-	}
-
-	summary, err := callOpenRouter(reqBody, apiKey)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(summary), nil
 }
 
 // generateGeneralSummary generează un rezumat general foarte scurt - PRIMEȘTE TOT TEXTUL PDF
@@ -476,12 +442,10 @@ func generateGeneralSummary(text string, language string) (string, error) {
 		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
 	}
 
-	// Pentru rezumatul general, folosim tot textul dar îl comprimăm inteligent
-	// Luăm primele 3000 de caractere, mijlocul și ultimele 3000
 	var textForSummary string
 	textLen := len(text)
 
-	if textLen <= 8000 {
+	if textLen <= 9000 {
 		textForSummary = text
 	} else {
 		start := text[:3000]
@@ -494,13 +458,12 @@ func generateGeneralSummary(text string, language string) (string, error) {
 
 ATENȚIE: Primești TOT TEXTUL PDF-ului, nu doar un fragment!
 
-LIMBA: %s (folosește diacritice corecte pentru română)
+TREBUIE SCRIS NEAPARAT ÎN LIMBA: %s
 
 Instrucțiuni pentru REZUMAT GENERAL:
-- Maxim 3-4 propoziții
 - Doar ideile principale și tema centrală din ÎNTREG documentul
 - Identifică subiectul principal al întregului PDF
-- Stil profesional și clar
+- Stil profesional și clar, incearcă să fie cât mai lung, să exprimi cât mai mult
 - NU menționează că este un fragment sau chunk
 
 TEXT COMPLET PDF:
@@ -509,7 +472,7 @@ TEXT COMPLET PDF:
 	reqBody := OpenRouterRequest{
 		Model:       OpenRouterModel,
 		Temperature: 0.2,
-		MaxTokens:   200,
+		MaxTokens:   1000,
 		Messages: []OpenRouterMessage{
 			{
 				Role:    "system",
@@ -530,235 +493,63 @@ TEXT COMPLET PDF:
 	return strings.TrimSpace(summary), nil
 }
 
-// generateCustomGeneralSummary generează rezumat general personalizat (o linie sau o pagină)
-func generateCustomGeneralSummary(text string, language string) (string, error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
-	}
+// detectLanguageFromText detects the language using AI Request
+// func detectLanguageFromText(text string) (string, error) {
+// 	apiKey := os.Getenv("OPENROUTER_API_KEY")
+// 	if apiKey == "" {
+// 		return "english", nil // Default fallback
+// 	}
 
-	// Pentru rezumatul general, folosim tot textul dar îl comprimăm inteligent
-	var textForSummary string
-	textLen := len(text)
+// 	sampleText := text
+// 	if len(text) > 500 {
+// 		sampleText = text[:500]
+// 	}
 
-	if textLen <= 8000 {
-		textForSummary = text
-	} else {
-		start := text[:3000]
-		middle := text[textLen/2-1500 : textLen/2+1500]
-		end := text[textLen-3000:]
-		textForSummary = start + "\n\n[...mijloc document...]\n\n" + middle + "\n\n[...sfârșit document...]\n\n" + end
-	}
+// 	prompt := fmt.Sprintf(`Detectează limba principală din următorul text și returnează DOAR numele limbii în engleză.
 
-	var instructions string
-	var maxTokens int
+// Răspunde cu UNA din următoarele opțiuni exacte, CA EXEMPLU:
+// 	- english
+// 	- romanian
+// 	- french etc.
+// Returnează DOAR numele limbii, fără explicații.
 
-	instructions = `
-	Scrie-mi un rezumat profesional despre acest document:
-	- Stil profesional și complet`
+// TEXT:
+// %s`, sampleText)
 
-	maxTokens = 5000
+// 	reqBody := OpenRouterRequest{
+// 		Model:       OpenRouterModel,
+// 		Temperature: 0.1,
+// 		MaxTokens:   10,
+// 		Messages: []OpenRouterMessage{
+// 			{
+// 				Role:    "system",
+// 				Content: "Ești un expert în detectarea limbilor. Răspunzi doar cu numele limbii în engleză.",
+// 			},
+// 			{
+// 				Role:    "user",
+// 				Content: prompt,
+// 			},
+// 		},
+// 	}
 
-	prompt := fmt.Sprintf(`Analizează ÎNTREG documentul PDF și fă un rezumat personalizat.
+// 	response, err := callOpenRouter(reqBody, apiKey)
+// 	if err != nil {
+// 		fmt.Printf("Error at detecting language: %v, using English as default\n", err)
+// 		return "english", nil
+// 	}
 
-ATENȚIE: Primești TOT TEXTUL PDF-ului, nu doar un fragment!
+// 	language := strings.ToLower(strings.TrimSpace(response))
 
-LIMBA: %s (folosește diacritice corecte pentru română)
+// 	fmt.Printf("Detected language: %s\n", language)
 
-%s
+// 	return language, nil
+// }
 
-IMPORTANT: NU menționează că este un fragment sau chunk. Analizează documentul complet!
+/*
+NEEDS TESTS, MIGHT BE DEVELOPED IN FUTURE
+COULD BE PROCESSED AS MULTIPLE SOLUTION
+------------------------------------------
 
-TEXT COMPLET PDF:
-%s`, language, instructions, textForSummary)
-
-	reqBody := OpenRouterRequest{
-		Model:       OpenRouterModel,
-		Temperature: 0.2,
-		MaxTokens:   maxTokens,
-		Messages: []OpenRouterMessage{
-			{
-				Role:    "system",
-				Content: fmt.Sprintf("Ești un expert în rezumarea concisă de texte în limba %s.", language),
-			},
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
-	}
-
-	summary, err := callOpenRouter(reqBody, apiKey)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(summary), nil
-}
-
-// generateChaptersPDF creează PDF pentru rezumatul pe capitole
-func generateChaptersPDF(chapters []ChapterInfo, totalPages int, filename string) error {
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.AddPage()
-	pdf.SetFont("Arial", "B", 16)
-
-	// Titlu
-	pdf.Cell(0, 10, "Rezumat pe Capitole")
-	pdf.Ln(15)
-
-	// Informații generale
-	pdf.SetFont("Arial", "", 12)
-	pdf.Cell(0, 8, fmt.Sprintf("Pagini originale: %d", totalPages))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Capitole detectate: %d", len(chapters)))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Generat la: %s", time.Now().Format("02/01/2006 15:04")))
-	pdf.Ln(15)
-
-	// Capitole
-	for _, chapter := range chapters {
-		pdf.SetFont("Arial", "B", 14)
-		pdf.Cell(0, 10, fmt.Sprintf("Capitol %d: %s", chapter.Number, chapter.Title))
-		pdf.Ln(8)
-
-		pdf.SetFont("Arial", "I", 10)
-		pdf.Cell(0, 6, chapter.Pages)
-		pdf.Ln(8)
-
-		pdf.SetFont("Arial", "", 11)
-		pdf.MultiCell(0, 6, chapter.Summary, "", "", false)
-		pdf.Ln(10)
-
-		// Pagină nouă la fiecare 2 capitole
-		if chapter.Number%2 == 0 && chapter.Number < len(chapters) {
-			pdf.AddPage()
-		}
-	}
-
-	return pdf.OutputFileAndClose(filename)
-}
-
-// generateGeneralSummaryPDF creează PDF pentru rezumatul general
-func generateGeneralSummaryPDF(summary string, totalPages int, oneLine bool, filename string) error {
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.AddPage()
-	pdf.SetFont("Arial", "B", 16)
-
-	// Titlu
-	title := "Rezumat General"
-	if oneLine {
-		title += " (O Linie)"
-	} else {
-		title += " (O Pagină)"
-	}
-	pdf.Cell(0, 10, title)
-	pdf.Ln(15)
-
-	// Informații
-	pdf.SetFont("Arial", "", 12)
-	pdf.Cell(0, 8, fmt.Sprintf("Pagini originale: %d", totalPages))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Generat la: %s", time.Now().Format("02/01/2006 15:04")))
-	pdf.Ln(15)
-
-	// Rezumat
-	pdf.SetFont("Arial", "B", 14)
-	pdf.Cell(0, 10, "Rezumat:")
-	pdf.Ln(10)
-
-	if oneLine {
-		pdf.SetFont("Arial", "", 14)
-		pdf.MultiCell(0, 8, summary, "", "C", false) // Centrat pentru o linie
-	} else {
-		pdf.SetFont("Arial", "", 12)
-		pdf.MultiCell(0, 7, summary, "", "", false)
-	}
-
-	return pdf.OutputFileAndClose(filename)
-}
-
-// generateLevelSummaryPDF creează PDF pentru rezumatul pe nivel
-func generateLevelSummaryPDF(level SummaryLevel, totalPages int, filename string) error {
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.AddPage()
-	pdf.SetFont("Arial", "B", 16)
-
-	// Titlu
-	pdf.Cell(0, 10, fmt.Sprintf("Rezumat Nivel %d", level.Level))
-	pdf.Ln(15)
-
-	// Informații
-	pdf.SetFont("Arial", "", 12)
-	pdf.Cell(0, 8, fmt.Sprintf("Pagini originale: %d", totalPages))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Nivel: %d", level.Level))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Pagini per chunk: %d", level.PagesPerChunk))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Descriere: %s", level.Description))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Generat la: %s", time.Now().Format("02/01/2006 15:04")))
-	pdf.Ln(15)
-
-	// Rezumat
-	pdf.SetFont("Arial", "B", 14)
-	pdf.Cell(0, 10, "Rezumat:")
-	pdf.Ln(10)
-
-	pdf.SetFont("Arial", "", 11)
-	pdf.MultiCell(0, 6, level.Summary, "", "", false)
-
-	return pdf.OutputFileAndClose(filename)
-}
-
-// generateSummaryPDF creează un PDF cu rezumatul
-func generateSummaryPDF(result *SummaryResult, filename string) error {
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.AddPage()
-	pdf.SetFont("Arial", "B", 16)
-
-	// Titlu
-	pdf.Cell(0, 10, "Rezumat PDF")
-	pdf.Ln(15)
-
-	// Informații generale
-	pdf.SetFont("Arial", "", 12)
-	pdf.Cell(0, 8, fmt.Sprintf("Pagini originale: %d", result.OriginalPages))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Generat la: %s", result.GeneratedAt.Format("02/01/2006 15:04")))
-	pdf.Ln(6)
-	pdf.Cell(0, 8, fmt.Sprintf("Timp procesare: %s", result.ProcessingTime))
-	pdf.Ln(12)
-
-	// Rezumat general
-	pdf.SetFont("Arial", "B", 14)
-	pdf.Cell(0, 10, "Rezumat General")
-	pdf.Ln(8)
-	pdf.SetFont("Arial", "", 11)
-	pdf.MultiCell(0, 6, result.GeneralSummary, "", "", false)
-	pdf.Ln(10)
-
-	// Rezumate pe niveluri
-	for _, level := range result.Levels {
-		if level.Summary != "" {
-			pdf.SetFont("Arial", "B", 12)
-			pdf.Cell(0, 8, fmt.Sprintf("Nivel %d - %s", level.Level, level.Description))
-			pdf.Ln(6)
-			pdf.SetFont("Arial", "", 10)
-			pdf.MultiCell(0, 5, level.Summary, "", "", false)
-			pdf.Ln(8)
-
-			// Pagină nouă la fiecare 2 niveluri pentru lizibilitate
-			if level.Level%2 == 0 && level.Level < 10 {
-				pdf.AddPage()
-			}
-		}
-	}
-
-	return pdf.OutputFileAndClose(filename)
-}
-
-// processSummaryRequest procesează cererea de rezumat
 func processSummaryRequest(request SummaryRequest) (*SummaryResult, error) {
 	startTime := time.Now()
 
@@ -766,7 +557,7 @@ func processSummaryRequest(request SummaryRequest) (*SummaryResult, error) {
 
 	language := request.Language
 	if language == "" {
-		language = "romanian"
+		language = "english"
 	}
 
 	result := &SummaryResult{
@@ -793,98 +584,22 @@ func processSummaryRequest(request SummaryRequest) (*SummaryResult, error) {
 		}
 	}
 
-	// 3. Calculează nivelurile de rezumat (vor lucra cu chunk-uri)
-	levels := calculateSummaryLevels(request.TotalPages)
+	// 3. Calculează nivelul de rezumat selectat (vor lucra cu chunk-uri)
+	selectedLevel := calculateSummaryLevels(request.TotalPages, request.DesiredLevel)
 
-	// 4. Generează rezumate pentru fiecare nivel (lucrează cu chunk-uri)
-	fmt.Printf("📄 Generez rezumate pe niveluri (chunk-uri)...\n")
-	for i := range levels {
-		summary, err := generateLevelSummary(request.Text, request.TotalPages, levels[i], language)
-		if err != nil {
-			fmt.Printf("⚠️ Eroare la nivelul %d: %v\n", levels[i].Level, err)
-			continue
-		}
-		levels[i].Summary = summary
+	// 4. Generează rezumat pentru nivelul selectat (lucrează cu chunk-uri)
+	fmt.Printf("📄 Generez rezumat pentru nivelul %d (chunk-uri)...\n", selectedLevel.Level)
+	summary, err := generateLevelSummary(request.Text, request.TotalPages, selectedLevel, language)
+	if err != nil {
+		fmt.Printf("⚠️ Eroare la generarea rezumatului la nivelul %d: %v\n", selectedLevel.Level, err)
+	} else {
+		selectedLevel.Summary = summary
 	}
 
-	result.Levels = levels
+	result.Levels = []SummaryLevel{selectedLevel}
 	result.ProcessingTime = time.Since(startTime).String()
 
 	fmt.Printf("✅ Rezumat generat cu succes în %s\n", result.ProcessingTime)
 	return result, nil
 }
-
-// saveSummaryResult salvează rezultatul într-un fișier JSON
-func saveSummaryResult(result *SummaryResult, filename string) error {
-	data, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(filename, data, 0644)
-}
-
-// detectLanguageFromText detectează limba din textul PDF folosind AI
-func detectLanguageFromText(text string) (string, error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return "romanian", nil // Default fallback
-	}
-
-	// Folosește primele 2000 de caractere pentru detecția limbii
-	sampleText := text
-	if len(text) > 2000 {
-		sampleText = text[:2000]
-	}
-
-	prompt := fmt.Sprintf(`Detectează limba principală din următorul text și returnează DOAR numele limbii în engleză.
-
-Răspunde cu UNA din următoarele opțiuni exacte:
-- romanian
-- english  
-- spanish
-- french
-- german
-- italian
-
-Returnează DOAR numele limbii, fără explicații.
-
-TEXT:
-%s`, sampleText)
-
-	reqBody := OpenRouterRequest{
-		Model:       OpenRouterModel,
-		Temperature: 0.1,
-		MaxTokens:   10,
-		Messages: []OpenRouterMessage{
-			{
-				Role:    "system",
-				Content: "Ești un expert în detectarea limbilor. Răspunzi doar cu numele limbii în engleză.",
-			},
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
-	}
-
-	response, err := callOpenRouter(reqBody, apiKey)
-	if err != nil {
-		fmt.Printf("⚠️ Eroare la detectarea limbii: %v, folosesc română ca default\n", err)
-		return "romanian", nil
-	}
-
-	language := strings.ToLower(strings.TrimSpace(response))
-
-	// Validează răspunsul
-	validLanguages := []string{"romanian", "english", "spanish", "french", "german", "italian"}
-	for _, valid := range validLanguages {
-		if language == valid {
-			fmt.Printf("🌍 Limbă detectată: %s\n", language)
-			return language, nil
-		}
-	}
-
-	fmt.Printf("🌍 Limbă nedeterminată, folosesc română ca default\n")
-	return "romanian", nil
-}
+*/

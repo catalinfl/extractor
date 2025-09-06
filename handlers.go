@@ -431,12 +431,8 @@ func handleChapterSummary(c *fiber.Ctx) error {
 
 	fmt.Printf("📚 Generez rezumat pe capitole pentru %d pagini din %s...\n", totalPages, filename)
 
-	// Detect language from PDF content
-	language, err := detectLanguageFromText(fullText)
-	if err != nil {
-		fmt.Printf("⚠️ Eroare la detectarea limbii: %v\n", err)
-		language = "romanian" // fallback
-	}
+	// Optional: allow client to force the language via form field `language`
+	language := c.FormValue("language", "english")
 
 	// Generate chapter summaries
 	chapters, err := generateChapterSummaries(fullText, language)
@@ -478,7 +474,6 @@ func handleGeneralSummary(c *fiber.Ctx) error {
 		})
 	}
 
-	// Extract text from PDF
 	pages, err := extractTextPages(fileData, fileType)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -487,21 +482,14 @@ func handleGeneralSummary(c *fiber.Ctx) error {
 		})
 	}
 
-	// Combine all pages into one text
 	fullText := strings.Join(pages, "\n\n")
 	totalPages := len(pages)
 
 	fmt.Printf("🎯 Generez rezumat general pentru %d pagini din %s...\n", totalPages, filename)
 
-	// Detect language from PDF content
-	language, err := detectLanguageFromText(fullText)
-	if err != nil {
-		fmt.Printf("⚠️ Eroare la detectarea limbii: %v\n", err)
-		language = "romanian" // fallback
-	}
+	language := c.FormValue("language", "english")
 
-	// Generate custom general summary
-	summary, err := generateCustomGeneralSummary(fullText, language)
+	summary, err := generateGeneralSummary(fullText, language)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -519,7 +507,6 @@ func handleGeneralSummary(c *fiber.Ctx) error {
 	})
 }
 
-// 3. HANDLER PENTRU REZUMAT PE NIVELE - PRIMEȘTE PDF CA FORMFILE
 func handleLevelSummary(c *fiber.Ctx) error {
 	// Get level parameter from form
 	levelStr := c.FormValue("level", "1")
@@ -548,7 +535,11 @@ func handleLevelSummary(c *fiber.Ctx) error {
 	}
 
 	// Extract text from PDF
+	startExtract := time.Now()
 	pages, err := extractTextPages(fileData, fileType)
+	extractDuration := time.Since(startExtract)
+	fmt.Printf("⏱️ PDF extraction took: %v\n", extractDuration)
+	fmt.Printf("📄 Extracted %d pages\n", len(pages))
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -557,32 +548,34 @@ func handleLevelSummary(c *fiber.Ctx) error {
 	}
 
 	// Combine all pages into one text
+	startCombine := time.Now()
 	fullText := strings.Join(pages, "\n\n")
 	totalPages := len(pages)
+	combineDuration := time.Since(startCombine)
+	fmt.Printf("⏱️ Text combination took: %v, total chars: %d\n", combineDuration, len(fullText))
 
 	fmt.Printf("📊 Generez rezumat nivel %d pentru %d pagini din %s...\n", level, totalPages, filename)
 
-	// Detect language from PDF content
-	language, err := detectLanguageFromText(fullText)
-	if err != nil {
-		fmt.Printf("⚠️ Eroare la detectarea limbii: %v\n", err)
-		language = "romanian" // fallback
-	}
+	// Optional: allow client to force the language via form field `language`
+	language := c.FormValue("language", "english")
 
 	// Calculate configuration for selected level
-	levels := calculateSummaryLevels(totalPages)
-	selectedLevel := levels[level-1] // Index 0-based
+	startConfig := time.Now()
+	selectedLevel := calculateSummaryLevels(totalPages, level)
+	configDuration := time.Since(startConfig)
+	fmt.Printf("⏱️ Level calculation took: %v, chunks will be: %d pages per chunk\n", configDuration, selectedLevel.PagesPerChunk)
 
 	// Generate summary for selected level only
+	startSummary := time.Now()
 	summary, err := generateLevelSummary(fullText, totalPages, selectedLevel, language)
+	summaryDuration := time.Since(startSummary)
+	fmt.Printf("⏱️ Summary generation took: %v\n", summaryDuration)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
 			"error":   "Failed to generate level summary: " + err.Error(),
 		})
 	}
-
-	selectedLevel.Summary = summary
 
 	return c.JSON(fiber.Map{
 		"success":        true,
@@ -591,6 +584,7 @@ func handleLevelSummary(c *fiber.Ctx) error {
 		"original_pages": totalPages,
 		"language":       language,
 		"level":          selectedLevel,
+		"summary":        summary,
 	})
 }
 
@@ -625,12 +619,7 @@ func handleDownloadChapterSummaryPDF(c *fiber.Ctx) error {
 	fullText := strings.Join(pages, "\n\n")
 	totalPages := len(pages)
 
-	// Detect language from PDF content
-	language, err := detectLanguageFromText(fullText)
-	if err != nil {
-		fmt.Printf("⚠️ Eroare la detectarea limbii: %v\n", err)
-		language = "romanian" // fallback
-	}
+	language := c.FormValue("language", "english")
 
 	// Generate chapters
 	chapters, err := generateChapterSummaries(fullText, language)
@@ -657,12 +646,7 @@ func handleDownloadChapterSummaryPDF(c *fiber.Ctx) error {
 	return c.SendFile(pdfFilename)
 }
 
-// HANDLER PENTRU DESCĂRCARE PDF GENERAL - PRIMEȘTE PDF CA FORMFILE
 func handleDownloadGeneralSummaryPDF(c *fiber.Ctx) error {
-	// Get one_line parameter from form
-	oneLine := c.FormValue("one_line", "false") == "true"
-
-	// Extract PDF file from form
 	fileData, fileType, filename, err := getFileFromRequest(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -678,7 +662,6 @@ func handleDownloadGeneralSummaryPDF(c *fiber.Ctx) error {
 		})
 	}
 
-	// Extract text from PDF
 	pages, err := extractTextPages(fileData, fileType)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -687,19 +670,13 @@ func handleDownloadGeneralSummaryPDF(c *fiber.Ctx) error {
 		})
 	}
 
-	// Combine all pages into one text
 	fullText := strings.Join(pages, "\n\n")
 	totalPages := len(pages)
 
-	// Detect language from PDF content
-	language, err := detectLanguageFromText(fullText)
-	if err != nil {
-		fmt.Printf("⚠️ Eroare la detectarea limbii: %v\n", err)
-		language = "romanian" // fallback
-	}
+	language := c.FormValue("language", "english")
 
 	// Generate general summary
-	summary, err := generateCustomGeneralSummary(fullText, language)
+	summary, err := generateGeneralSummary(fullText, language)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -709,7 +686,7 @@ func handleDownloadGeneralSummaryPDF(c *fiber.Ctx) error {
 
 	// Create PDF for general summary
 	pdfFilename := fmt.Sprintf("tmp/general_%d.pdf", time.Now().Unix())
-	err = generateGeneralSummaryPDF(summary, totalPages, oneLine, pdfFilename)
+	err = generateGeneralSummaryPDF(summary, totalPages, pdfFilename)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -764,16 +741,10 @@ func handleDownloadLevelSummaryPDF(c *fiber.Ctx) error {
 	fullText := strings.Join(pages, "\n\n")
 	totalPages := len(pages)
 
-	// Detect language from PDF content
-	language, err := detectLanguageFromText(fullText)
-	if err != nil {
-		fmt.Printf("⚠️ Eroare la detectarea limbii: %v\n", err)
-		language = "romanian" // fallback
-	}
+	language := c.FormValue("language", "english")
 
 	// Calculate and generate level
-	levels := calculateSummaryLevels(totalPages)
-	selectedLevel := levels[level-1]
+	selectedLevel := calculateSummaryLevels(totalPages, level)
 
 	summary, err := generateLevelSummary(fullText, totalPages, selectedLevel, language)
 	if err != nil {
